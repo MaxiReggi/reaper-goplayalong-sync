@@ -1,0 +1,7 @@
+.vscode/*
+!.vscode/launch.json
+**/.DS_Store
+/*build*
+/.idea
+/.vs
+/third_party
