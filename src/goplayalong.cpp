@@ -1,160 +1,324 @@
 #include "goplayalong.h"
 
-#include "process_reader.h"
-#include "wstring_utils.h"
+#include <windows.h>
+#include <psapi.h>
+#include <tlhelp32.h>
 
-#include <format>
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstring>
 #include <stdexcept>
-#include <utility>
+#include <vector>
 
 // =============================================================================
-// HOW TO COMPLETE THIS FILE (requires Windows + GoPlayAlong 4 running)
-// =============================================================================
+// Dynamic position discovery — no hardcoded pointer chains
 //
-// This file reads GoPlayAlong's internal memory to extract playback state.
-// The memory offsets below are PLACEHOLDERS and must be found using scanmem
-// or CheatEngine on Windows/Wine with GoPlayAlong 4 running.
+// GoPlayAlong 4 allocates playback state in dynamic heap memory (Electron/V8),
+// so static pointer chains don't survive process restarts. Instead, on each
+// plugin activation we scan GoPlayAlong's memory for a double that advances
+// at ~1.0 second per real second (normal playback rate). Once found, the
+// address is cached for the session.
 //
-// STEP 1 — Find the process name and module
-//   Open Windows Task Manager (or Process Explorer) while GoPlayAlong is running.
-//   Note the exact .exe name (e.g. "GoPlayAlong.exe", "GoPlayAlong 4.exe").
-//   If it is an Adobe AIR app, the main module IS the .exe itself — use the
-//   same name for both PROCESS_NAME and MODULE_NAME below.
-//   Update the constants PROCESS_NAME and MODULE_NAME accordingly.
+// What we know from reverse engineering:
+//   - Process name:  "Go PlayAlong 4.exe"  (5 processes, pick largest RSS)
+//   - Position type: double (seconds)
+//   - Written by:    movsd [eax+03],xmm1   at Go PlayAlong 4.exe+0x33E6A23
+//   - Module base:   0x00730000 (no ASLR on this app)
 //
-// STEP 2 — Find the playback position in memory
-//   Using scanmem (Linux/Wine) or CheatEngine (Windows):
-//     a) Play a song, pause at a known position (e.g. exactly 10 seconds).
-//     b) Search for the value 10.0 as a float or double.
-//        Also try searching for the value in samples (10 * 44100 = 441000)
-//        as an int, in case GoPlayAlong stores position in samples like Guitar Pro.
-//     c) Resume playback, pause again at a new position. Filter the results.
-//     d) Repeat until you narrow it down to 1-3 addresses.
-//     e) Use "Find what accesses this address" to trace back to the base pointer.
-//        CheatEngine will show you the pointer chain (e.g. module+0xABCD -> +0x18 -> +0x40).
-//   Record the MODULE_OFFSET and POSITION_OFFSETS chain.
-//
-// STEP 3 — Find play state, loop state, and play rate
-//   Repeat the same process for:
-//     - play_state:  search for a boolean/DWORD that is 1 when playing, 0 when stopped
-//     - loop_state:  search for a boolean/DWORD that is 1 when loop is enabled
-//     - play_rate:   search for a float near 1.0 (100% speed), change speed, filter
-//   These are bit flags in Guitar Pro — they may be plain bools in GoPlayAlong.
-//   Adjust the state-reading code below as needed.
-//
-// STEP 4 — Determine position units
-//   Check whether the position value is:
-//     - Seconds (double/float): use it directly
-//     - Samples (int at 44100 Hz): divide by SAMPLE_RATE
-//     - Milliseconds (int): divide by 1000.0
-//   Update the state-building section at the bottom of ReadProcessMemory().
-//
-// STEP 5 — Verify version handling
-//   Call process_reader.GetProcessVersion() and check the returned string.
-//   If GoPlayAlong has a single stable memory layout across versions, you can
-//   skip version-specific offsets. Otherwise, add cases as in Guitar Pro.
-//
+// Other state (play_state, loop, time_selection, play_rate) is not yet found.
+// play_state is inferred from the position rate-of-change.
 // =============================================================================
 
 namespace tnt {
 
-// TODO(windows): Update these after identifying the process in Task Manager.
-static constexpr wchar_t PROCESS_NAME[] = L"GoPlayAlong.exe";
-static constexpr wchar_t MODULE_NAME[]  = L"GoPlayAlong.exe"; // Same as process if no separate DLL
+static constexpr wchar_t PROCESS_NAME[]  = L"Go PlayAlong 4.exe";
+static constexpr double  MAX_DURATION    = 10800.0; // 3 hours in seconds
+static constexpr double  MIN_POSITION    = 0.5;     // must be past first 0.5 s to scan
+static constexpr int     CONFIRM_TICKS   = 5;       // consistent ticks needed to commit
+static constexpr double  RATE_TOLERANCE  = 0.20;    // ±20% on the expected 1.0 s/s rate
+static constexpr int     RESCAN_INTERVAL = 150;     // filter ticks before giving up and re-scanning
 
-// TODO(windows): Update after finding the module base offset with scanmem/CheatEngine.
-static constexpr int MODULE_OFFSET = 0x00000000;
-
-// TODO(windows): Replace these placeholder offset chains with the real ones.
-// Format: each list follows the pointer chain as exported by CheatEngine.
-// Example from Guitar Pro: { 0x18, 0xA0, 0x38, 0x1A8, 0x20, 0x1D8, 0x0 }
-//
-// If GoPlayAlong stores position as a double/float (seconds), use that directly.
-// If it stores position as samples (int), divide by SAMPLE_RATE below.
-static constexpr int POSITION_OFFSETS[]              = {0x0}; // TODO(windows)
-static constexpr int TIME_SELECTION_START_OFFSETS[]  = {0x0}; // TODO(windows)
-static constexpr int TIME_SELECTION_END_OFFSETS[]    = {0x0}; // TODO(windows)
-static constexpr int PLAY_RATE_OFFSETS[]             = {0x0}; // TODO(windows)
-static constexpr int PLAY_STATE_OFFSETS[]            = {0x0}; // TODO(windows)
-static constexpr int LOOP_STATE_OFFSETS[]            = {0x0}; // TODO(windows)
-static constexpr int COUNT_IN_STATE_OFFSETS[]        = {0x0}; // TODO(windows) - may not exist in GoPlayAlong
-
-// TODO(windows): Verify whether GoPlayAlong stores position in samples or seconds.
-// Guitar Pro uses 44100 Hz. Set to 1 if position is already in seconds.
-static constexpr int SAMPLE_RATE = 44100;
-
-// TODO(windows): Adjust flag bit positions if GoPlayAlong uses bit fields like Guitar Pro.
-// If it uses plain bool values, change the state extraction below accordingly.
-static constexpr int PLAY_STATE_FLAG_BIT  = 8;
-static constexpr int LOOP_STATE_FLAG_BIT  = 8;
-static constexpr int COUNT_IN_FLAG_BIT    = 8;
-
-struct GoPlayAlong::Impl final
+struct GoPlayAlong::Impl
 {
-    GoPlayAlongState ReadProcessMemory()
+    HANDLE    m_process       = nullptr;
+    uintptr_t m_position_addr = 0;
+    double    m_last_position = 0.0;
+    bool      m_is_playing    = false;
+    int       m_paused_ticks  = 0;
+
+    struct Region {
+        uintptr_t base;
+        SIZE_T    size;
+    };
+
+    struct Candidate {
+        uintptr_t address;
+        double    last_value;
+        int       ticks;          // -1 = invalid, remove on next pass
+        size_t    region_idx;
+        size_t    region_offset;
+    };
+
+    std::vector<Region>    m_regions;
+    std::vector<Candidate> m_candidates;
+    bool                   m_scan_done    = false;
+    int                    m_filter_ticks = 0;
+    std::chrono::steady_clock::time_point m_last_tick;
+
+    ~Impl() { CloseProcess(); }
+
+    void CloseProcess()
     {
-        const ProcessReader reader(PROCESS_NAME, MODULE_NAME);
+        if (m_process) { CloseHandle(m_process); m_process = nullptr; }
+        Reset();
+    }
 
-        // Optional: version check — add cases here if offsets differ between versions.
-        // const auto version = reader.GetProcessVersion();
+    void Reset()
+    {
+        m_position_addr = 0;
+        m_regions.clear();
+        m_candidates.clear();
+        m_scan_done    = false;
+        m_filter_ticks = 0;
+        m_is_playing   = false;
+        m_paused_ticks = 0;
+    }
 
-        // Read raw values from process memory
-        // TODO(windows): Change the type parameter <int> to match what GoPlayAlong
-        // actually stores (e.g. <double>, <float>, or <int> for samples).
-        const int raw_position = reader.ReadMemoryAddress<int>(
-            MODULE_OFFSET, {POSITION_OFFSETS[0]});
-
-        int raw_sel_start = reader.ReadMemoryAddress<int>(
-            MODULE_OFFSET, {TIME_SELECTION_START_OFFSETS[0]});
-
-        int raw_sel_end = reader.ReadMemoryAddress<int>(
-            MODULE_OFFSET, {TIME_SELECTION_END_OFFSETS[0]});
-
-        const float raw_play_rate = reader.ReadMemoryAddress<float>(
-            MODULE_OFFSET, {PLAY_RATE_OFFSETS[0]});
-
-        // TODO(windows): Adjust these reads based on whether GoPlayAlong uses
-        // bit flags (DWORD) or plain booleans (bool/BYTE) for state values.
-        const DWORD raw_play_state = reader.ReadMemoryAddress<DWORD>(
-            MODULE_OFFSET, {PLAY_STATE_OFFSETS[0]});
-
-        const DWORD raw_loop_state = reader.ReadMemoryAddress<DWORD>(
-            MODULE_OFFSET, {LOOP_STATE_OFFSETS[0]});
-
-        const DWORD raw_count_in = reader.ReadMemoryAddress<DWORD>(
-            MODULE_OFFSET, {COUNT_IN_STATE_OFFSETS[0]});
-
-        // Ensure time selection start is always before end
-        if (raw_sel_start > raw_sel_end)
+    // Opens the GoPlayAlong process with the largest working set (main process,
+    // not one of the helper sub-processes).
+    bool EnsureProcess()
+    {
+        if (m_process)
         {
-            std::swap(raw_sel_start, raw_sel_end);
+            DWORD code = 0;
+            if (GetExitCodeProcess(m_process, &code) && code == STILL_ACTIVE)
+                return true;
+            CloseProcess();
         }
 
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap == INVALID_HANDLE_VALUE) return false;
+
+        PROCESSENTRY32W e{};
+        e.dwSize = sizeof(e);
+        DWORD  best_pid = 0;
+        SIZE_T best_mem = 0;
+
+        if (Process32FirstW(snap, &e))
+        {
+            do {
+                if (wcscmp(e.szExeFile, PROCESS_NAME) != 0) continue;
+
+                HANDLE h = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, e.th32ProcessID);
+                if (!h) continue;
+
+                PROCESS_MEMORY_COUNTERS pmc{};
+                pmc.cb = sizeof(pmc);
+                if (GetProcessMemoryInfo(h, &pmc, sizeof(pmc)) && pmc.WorkingSetSize > best_mem)
+                {
+                    best_mem = pmc.WorkingSetSize;
+                    best_pid = e.th32ProcessID;
+                }
+                CloseHandle(h);
+            } while (Process32NextW(snap, &e));
+        }
+        CloseHandle(snap);
+
+        if (!best_pid) return false;
+        m_process = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, best_pid);
+        return m_process != nullptr;
+    }
+
+    bool ReadDouble(uintptr_t addr, double& out) const
+    {
+        SIZE_T n = 0;
+        return ::ReadProcessMemory(m_process, reinterpret_cast<LPCVOID>(addr), &out, 8, &n) && n == 8;
+    }
+
+    // Reads all readable, non-executable memory pages and collects every
+    // 8-byte-aligned double in [MIN_POSITION, MAX_DURATION] as a candidate.
+    // Skips code pages and large (>64 MB) mappings to reduce scan time.
+    // May block for ~0.5–1 second on first call depending on process memory size.
+    void ScanMemory()
+    {
+        m_regions.clear();
+        m_candidates.clear();
+
+        constexpr DWORD EXEC_FLAGS = PAGE_EXECUTE | PAGE_EXECUTE_READ
+                                   | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+        constexpr DWORD READ_FLAGS = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY;
+
+        MEMORY_BASIC_INFORMATION mbi{};
+        uintptr_t addr = 0;
+
+        while (VirtualQueryEx(m_process, reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi)) == sizeof(mbi))
+        {
+            uintptr_t base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+            uintptr_t next = base + mbi.RegionSize;
+
+            bool scannable = (mbi.State == MEM_COMMIT)
+                          && (mbi.Protect & READ_FLAGS)
+                          && !(mbi.Protect & EXEC_FLAGS)
+                          && !(mbi.Protect & PAGE_GUARD)
+                          && (mbi.RegionSize >= 8)
+                          && (mbi.RegionSize <= 64ULL * 1024 * 1024);
+
+            if (scannable)
+            {
+                std::vector<BYTE> buf(mbi.RegionSize);
+                SIZE_T n = 0;
+                if (::ReadProcessMemory(m_process, mbi.BaseAddress, buf.data(), mbi.RegionSize, &n) && n >= 8)
+                {
+                    size_t ri     = m_regions.size();
+                    bool   pushed = false;
+
+                    for (size_t i = 0; i + 8 <= n; i += 8)
+                    {
+                        double val;
+                        memcpy(&val, buf.data() + i, 8);
+                        if (std::isfinite(val) && val >= MIN_POSITION && val <= MAX_DURATION)
+                        {
+                            if (!pushed)
+                            {
+                                m_regions.push_back({ base, static_cast<SIZE_T>(n) });
+                                pushed = true;
+                            }
+                            m_candidates.push_back({ base + i, val, 0, ri, i });
+                        }
+                    }
+                }
+            }
+
+            if (next <= addr) break;
+            addr = next;
+        }
+
+        m_scan_done    = true;
+        m_filter_ticks = 0;
+        m_last_tick    = std::chrono::steady_clock::now();
+    }
+
+    // Re-reads each candidate region and updates ticks based on rate of change.
+    // A candidate that advances at ~1.0 s/s (±RATE_TOLERANCE) increments its
+    // tick counter. After CONFIRM_TICKS consistent ticks the address is committed.
+    // Paused playback (delta ≈ 0) neither increments nor resets ticks.
+    void FilterCandidates()
+    {
+        auto   now = std::chrono::steady_clock::now();
+        double dt  = std::chrono::duration<double>(now - m_last_tick).count();
+        m_last_tick = now;
+        ++m_filter_ticks;
+
+        if (dt < 0.005 || dt > 2.0) return;
+
+        for (size_t ri = 0; ri < m_regions.size(); ++ri)
+        {
+            std::vector<BYTE> buf(m_regions[ri].size);
+            SIZE_T n = 0;
+            bool ok = ::ReadProcessMemory(m_process,
+                reinterpret_cast<LPCVOID>(m_regions[ri].base),
+                buf.data(), m_regions[ri].size, &n);
+
+            for (auto& c : m_candidates)
+            {
+                if (c.region_idx != ri || c.ticks < 0) continue;
+
+                if (!ok || c.region_offset + 8 > n) { c.ticks = -1; continue; }
+
+                double new_val;
+                memcpy(&new_val, buf.data() + c.region_offset, 8);
+
+                if (!std::isfinite(new_val) || new_val < 0.0 || new_val > MAX_DURATION)
+                {
+                    c.ticks = -1;
+                    continue;
+                }
+
+                double delta = new_val - c.last_value;
+                c.last_value = new_val;
+
+                if (delta >= dt * (1.0 - RATE_TOLERANCE) && delta <= dt * (1.0 + RATE_TOLERANCE))
+                    ++c.ticks;
+                else if (delta < -0.5 || delta > dt * 4.0)
+                    c.ticks = 0; // bad jump: reset but keep candidate
+                // delta ≈ 0 (paused): leave ticks unchanged
+            }
+        }
+
+        m_candidates.erase(
+            std::remove_if(m_candidates.begin(), m_candidates.end(),
+                [](const Candidate& c) { return c.ticks < 0; }),
+            m_candidates.end());
+
+        auto best = std::max_element(m_candidates.begin(), m_candidates.end(),
+            [](const Candidate& a, const Candidate& b) { return a.ticks < b.ticks; });
+
+        if (best != m_candidates.end() && best->ticks >= CONFIRM_TICKS)
+        {
+            m_position_addr = best->address;
+            m_candidates.clear();
+            m_regions.clear();
+            return;
+        }
+
+        // Trigger a fresh scan if candidates ran out or discovery is taking too long
+        if (m_candidates.empty() || m_filter_ticks >= RESCAN_INTERVAL)
+            m_scan_done = false;
+    }
+
+    GoPlayAlongState ReadProcessMemory()
+    {
         GoPlayAlongState state{};
+        state.play_rate = 1.0;
 
-        // TODO(windows): Adjust the position conversion to match the unit used by GoPlayAlong.
-        // If position is stored in samples:   divide by SAMPLE_RATE
-        // If position is stored in seconds:   cast directly to double
-        // If position is stored in ms:        divide by 1000.0
-        state.play_position                  = static_cast<double>(raw_position) / SAMPLE_RATE;
-        state.time_selection_start_position  = static_cast<double>(raw_sel_start) / SAMPLE_RATE;
-        state.time_selection_end_position    = static_cast<double>(raw_sel_end)   / SAMPLE_RATE;
-        state.play_rate                      = static_cast<double>(raw_play_rate);
+        if (!EnsureProcess())
+            throw std::runtime_error(
+                "GoPlayAlong 4 not found.\n"
+                "Open GoPlayAlong 4 with a song loaded and press play.\n");
 
-        // TODO(windows): If GoPlayAlong uses plain booleans instead of bit flags,
-        // replace these with: state.play_state = raw_play_state != 0;
-        state.play_state     = raw_play_state  & (1U << PLAY_STATE_FLAG_BIT);
-        state.loop_state     = raw_loop_state  & (1U << LOOP_STATE_FLAG_BIT);
-        state.count_in_state = raw_count_in    & (1U << COUNT_IN_FLAG_BIT);
+        // Phase 1: one-time memory scan (may block ~0.5-1 s on first call)
+        if (!m_scan_done)
+        {
+            ScanMemory();
+            return state;
+        }
 
+        // Phase 2: rate-of-change filtering across timer ticks
+        if (m_position_addr == 0)
+        {
+            FilterCandidates();
+            return state; // GoPlayAlong must be playing for discovery to complete
+        }
+
+        // Phase 3: steady-state position read
+        double position = 0.0;
+        if (!ReadDouble(m_position_addr, position)
+            || !std::isfinite(position) || position < 0.0 || position > MAX_DURATION)
+        {
+            Reset(); // address gone (song changed or app restarted); redo discovery
+            return state;
+        }
+
+        double delta = position - m_last_position;
+        if (delta > 0.005 && delta < 0.5)
+        {
+            m_is_playing   = true;
+            m_paused_ticks = 0;
+        }
+        else if (++m_paused_ticks > 3)
+        {
+            m_is_playing = false;
+        }
+        m_last_position = position;
+
+        state.play_position = position;
+        state.play_state    = m_is_playing;
         return state;
     }
 };
 
-GoPlayAlong::GoPlayAlong()
-    : m_impl(std::make_unique<Impl>())
-{}
-
+GoPlayAlong::GoPlayAlong()  : m_impl(std::make_unique<Impl>()) {}
 GoPlayAlong::~GoPlayAlong() = default;
 
 GoPlayAlongState GoPlayAlong::ReadProcessMemory()
@@ -162,4 +326,4 @@ GoPlayAlongState GoPlayAlong::ReadProcessMemory()
     return m_impl->ReadProcessMemory();
 }
 
-}
+} // namespace tnt
