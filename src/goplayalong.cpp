@@ -32,20 +32,26 @@
 
 namespace tnt {
 
-static constexpr wchar_t PROCESS_NAME[]  = L"Go PlayAlong 4.exe";
-static constexpr double  MAX_DURATION    = 10800.0; // 3 hours in seconds
-static constexpr double  MIN_POSITION    = 0.5;     // must be past first 0.5 s to scan
-static constexpr int     CONFIRM_TICKS   = 5;       // consistent ticks needed to commit
-static constexpr double  RATE_TOLERANCE  = 0.20;    // ±20% on the expected 1.0 s/s rate
-static constexpr int     RESCAN_INTERVAL = 150;     // filter ticks before giving up and re-scanning
+static constexpr wchar_t PROCESS_NAME[]          = L"Go PlayAlong 4.exe";
+static constexpr double  MAX_DURATION            = 10800.0; // 3 hours in seconds
+static constexpr double  MIN_POSITION            = 0.5;     // must be past first 0.5 s to scan
+static constexpr int     CONFIRM_TICKS           = 5;       // consistent ticks needed to commit
+static constexpr double  RATE_TOLERANCE          = 0.20;    // ±20% on the expected 1.0 s/s rate
+static constexpr int     RESCAN_INTERVAL         = 150;     // filter ticks before giving up and re-scanning
+static constexpr int     PAUSED_TICKS_THRESHOLD   = 10;      // ticks of no movement before declaring paused (~333ms)
+static constexpr int     STALE_ADDRESS_THRESHOLD  = 90;      // ticks of continuous pause before forcing rediscovery (~3s)
+static constexpr double  MIN_SCAN_INTERVAL_SEC    = 1.0;     // minimum seconds between scan restarts
+// Max bytes read per timer tick during the scan phase. Keeps each tick under ~2 ms
+// even on slow machines, so the REAPER main thread is never visibly blocked.
+static constexpr SIZE_T  SCAN_BYTES_PER_TICK     = 16ULL * 1024 * 1024;
 
 struct GoPlayAlong::Impl
 {
     HANDLE    m_process       = nullptr;
     uintptr_t m_position_addr = 0;
     double    m_last_position = 0.0;
-    bool      m_is_playing    = false;
-    int       m_paused_ticks  = 0;
+    bool      m_is_playing   = false;
+    int       m_paused_ticks = 0;
 
     struct Region {
         uintptr_t base;
@@ -60,9 +66,16 @@ struct GoPlayAlong::Impl
         size_t    region_offset;
     };
 
+    // Incremental scan state
+    bool   m_scan_done    = false; // true once all queued regions have been read
+    bool   m_scan_started = false; // true after BeginScan() until scan completes or resets
+    std::vector<MEMORY_BASIC_INFORMATION> m_scan_queue; // regions to read, populated by BeginScan()
+    size_t m_scan_progress = 0;                         // next index into m_scan_queue
+    std::chrono::steady_clock::time_point m_last_scan_time; // epoch → first scan always immediate
+
+    // Filter / discovery state
     std::vector<Region>    m_regions;
     std::vector<Candidate> m_candidates;
-    bool                   m_scan_done    = false;
     int                    m_filter_ticks = 0;
     std::chrono::steady_clock::time_point m_last_tick;
 
@@ -74,15 +87,21 @@ struct GoPlayAlong::Impl
         Reset();
     }
 
-    void Reset()
+    void Reset(bool skip_cooldown = false)
     {
-        m_position_addr = 0;
+        m_position_addr     = 0;
         m_regions.clear();
         m_candidates.clear();
-        m_scan_done    = false;
-        m_filter_ticks = 0;
+        m_scan_queue.clear();
+        m_scan_done         = false;
+        m_scan_started      = false;
+        m_scan_progress     = 0;
+        m_filter_ticks      = 0;
         m_is_playing   = false;
         m_paused_ticks = 0;
+        if (skip_cooldown)
+            m_last_scan_time = {}; // reset to epoch so BeginScan runs on the very next tick
+        // else: preserve m_last_scan_time to keep cooldown active and avoid scan thrashing
     }
 
     // Opens the GoPlayAlong process with the largest working set (main process,
@@ -136,12 +155,12 @@ struct GoPlayAlong::Impl
         return ::ReadProcessMemory(m_process, reinterpret_cast<LPCVOID>(addr), &out, 8, &n) && n == 8;
     }
 
-    // Reads all readable, non-executable memory pages and collects every
-    // 8-byte-aligned double in [MIN_POSITION, MAX_DURATION] as a candidate.
-    // Skips code pages and large (>64 MB) mappings to reduce scan time.
-    // May block for ~0.5–1 second on first call depending on process memory size.
-    void ScanMemory()
+    // Phase 1a — fast: walk the virtual address space with VirtualQueryEx and queue
+    // every scannable region. No ReadProcessMemory calls, completes in microseconds.
+    void BeginScan()
     {
+        m_scan_queue.clear();
+        m_scan_progress = 0;
         m_regions.clear();
         m_candidates.clear();
 
@@ -157,46 +176,61 @@ struct GoPlayAlong::Impl
             uintptr_t base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
             uintptr_t next = base + mbi.RegionSize;
 
-            bool scannable = (mbi.State == MEM_COMMIT)
-                          && (mbi.Protect & READ_FLAGS)
-                          && !(mbi.Protect & EXEC_FLAGS)
-                          && !(mbi.Protect & PAGE_GUARD)
-                          && (mbi.RegionSize >= 8)
-                          && (mbi.RegionSize <= 64ULL * 1024 * 1024);
-
-            if (scannable)
+            if ((mbi.State == MEM_COMMIT)
+                && (mbi.Protect & READ_FLAGS)
+                && !(mbi.Protect & EXEC_FLAGS)
+                && !(mbi.Protect & PAGE_GUARD)
+                && (mbi.RegionSize >= 8)
+                && (mbi.RegionSize <= 64ULL * 1024 * 1024))
             {
-                std::vector<BYTE> buf(mbi.RegionSize);
-                SIZE_T n = 0;
-                if (::ReadProcessMemory(m_process, mbi.BaseAddress, buf.data(), mbi.RegionSize, &n) && n >= 8)
-                {
-                    size_t ri     = m_regions.size();
-                    bool   pushed = false;
-
-                    for (size_t i = 0; i + 8 <= n; i += 8)
-                    {
-                        double val;
-                        memcpy(&val, buf.data() + i, 8);
-                        if (std::isfinite(val) && val >= MIN_POSITION && val <= MAX_DURATION)
-                        {
-                            if (!pushed)
-                            {
-                                m_regions.push_back({ base, static_cast<SIZE_T>(n) });
-                                pushed = true;
-                            }
-                            m_candidates.push_back({ base + i, val, 0, ri, i });
-                        }
-                    }
-                }
+                m_scan_queue.push_back(mbi);
             }
 
             if (next <= addr) break;
             addr = next;
         }
 
-        m_scan_done    = true;
-        m_filter_ticks = 0;
-        m_last_tick    = std::chrono::steady_clock::now();
+        m_last_scan_time = std::chrono::steady_clock::now();
+    }
+
+    // Phase 1b — reads up to SCAN_BYTES_PER_TICK of queued regions per call,
+    // so each timer tick blocks REAPER for at most ~2 ms instead of seconds.
+    // Returns true when all queued regions have been processed.
+    bool ContinueScan()
+    {
+        SIZE_T bytes_this_tick = 0;
+
+        while (m_scan_progress < m_scan_queue.size() && bytes_this_tick < SCAN_BYTES_PER_TICK)
+        {
+            const auto& mbi = m_scan_queue[m_scan_progress++];
+            bytes_this_tick += mbi.RegionSize;
+
+            uintptr_t base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+            std::vector<BYTE> buf(mbi.RegionSize);
+            SIZE_T n = 0;
+            if (!::ReadProcessMemory(m_process, mbi.BaseAddress, buf.data(), mbi.RegionSize, &n) || n < 8)
+                continue;
+
+            size_t ri     = m_regions.size();
+            bool   pushed = false;
+
+            for (size_t i = 0; i + 8 <= n; i += 8)
+            {
+                double val;
+                memcpy(&val, buf.data() + i, 8);
+                if (std::isfinite(val) && val >= MIN_POSITION && val <= MAX_DURATION)
+                {
+                    if (!pushed)
+                    {
+                        m_regions.push_back({ base, static_cast<SIZE_T>(n) });
+                        pushed = true;
+                    }
+                    m_candidates.push_back({ base + i, val, 0, ri, i });
+                }
+            }
+        }
+
+        return m_scan_progress >= m_scan_queue.size();
     }
 
     // Re-reads each candidate region and updates ticks based on rate of change.
@@ -264,7 +298,10 @@ struct GoPlayAlong::Impl
 
         // Trigger a fresh scan if candidates ran out or discovery is taking too long
         if (m_candidates.empty() || m_filter_ticks >= RESCAN_INTERVAL)
-            m_scan_done = false;
+        {
+            m_scan_done    = false;
+            m_scan_started = false;
+        }
     }
 
     GoPlayAlongState ReadProcessMemory()
@@ -277,10 +314,30 @@ struct GoPlayAlong::Impl
                 "GoPlayAlong 4 not found.\n"
                 "Open GoPlayAlong 4 with a song loaded and press play.\n");
 
-        // Phase 1: one-time memory scan (may block ~0.5-1 s on first call)
+        // Phase 1a: enumerate scannable regions (fast, no ReadProcessMemory).
+        // Guarded by a cooldown so that rapid Reset() calls (e.g. stale address after a
+        // song restart) don't hammer the process with repeated scans.
+        if (!m_scan_done && !m_scan_started)
+        {
+            auto now = std::chrono::steady_clock::now();
+            double elapsed = std::chrono::duration<double>(now - m_last_scan_time).count();
+            if (elapsed < MIN_SCAN_INTERVAL_SEC)
+                return state;
+            BeginScan();
+            m_scan_started = true;
+            return state;
+        }
+
+        // Phase 1b: read regions incrementally — at most SCAN_BYTES_PER_TICK per tick,
+        // so REAPER is never blocked for more than ~2 ms regardless of process size.
         if (!m_scan_done)
         {
-            ScanMemory();
+            if (ContinueScan())
+            {
+                m_scan_done    = true;
+                m_filter_ticks = 0;
+                m_last_tick    = std::chrono::steady_clock::now();
+            }
             return state;
         }
 
@@ -306,11 +363,28 @@ struct GoPlayAlong::Impl
             m_is_playing   = true;
             m_paused_ticks = 0;
         }
-        else if (++m_paused_ticks > 3)
+        else if (delta < -1.0)
+        {
+            // Large backward jump: user rewound or song restarted.
+            // Reset counter so the next advancing tick quickly re-detects play.
+            m_paused_ticks = 0;
+        }
+        else if (++m_paused_ticks > PAUSED_TICKS_THRESHOLD)
         {
             m_is_playing = false;
         }
         m_last_position = position;
+
+        // If position hasn't advanced for STALE_ADDRESS_THRESHOLD ticks (~3 s) AND is
+        // near zero, the address is probably stale: GoPlayAlong auto-rewound to the
+        // beginning and V8 GC moved the object. Force immediate rediscovery.
+        // Mid-song pauses (position >= MIN_POSITION) are left alone — the address is
+        // still valid and should resume instantly when GoPlayAlong plays again.
+        if (m_paused_ticks > STALE_ADDRESS_THRESHOLD && position < MIN_POSITION)
+        {
+            Reset(true);
+            return state;
+        }
 
         state.play_position = position;
         state.play_state    = m_is_playing;
