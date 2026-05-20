@@ -1,91 +1,83 @@
 #include "goplayalong.h"
-#include "process_reader.h"
 
-#include <chrono>
-#include <deque>
+#include "process_reader.h"
+#include "wstring_utils.h"
+
+#include <format>
 #include <stdexcept>
+#include <utility>
 
 namespace tnt {
 
 static constexpr wchar_t PROCESS_NAME[] = L"Go PlayAlong 4.exe";
 static constexpr wchar_t MODULE_NAME[]  = L"native.node";
-static constexpr int     MODULE_OFFSET  = 0x12FD18;
+
+static constexpr int MODULE_OFFSET = 0x12FD18;
+
 // Pointer chain: native.node+0x12FD18 → [+0x14] → [+0x0] → +0xC8 = double (seconds)
-static constexpr int POSITION_OFFSETS[] = {0x14, 0x0, 0xC8};
+static constexpr int POSITION_OFFSETS[]              = {0x14, 0x0, 0xC8};
+static constexpr int TIME_SELECTION_START_OFFSETS[]  = {0x0}; // TODO(windows)
+static constexpr int TIME_SELECTION_END_OFFSETS[]    = {0x0}; // TODO(windows)
+static constexpr int PLAY_RATE_OFFSETS[]             = {0x0}; // TODO(windows)
+static constexpr int PLAY_STATE_OFFSETS[]            = {0x0}; // TODO(windows)
+static constexpr int LOOP_STATE_OFFSETS[]            = {0x0}; // TODO(windows)
+static constexpr int COUNT_IN_STATE_OFFSETS[]        = {0x0}; // TODO(windows) - may not exist in GoPlayAlong
 
-// Ticks of no position advance before declaring paused (~333ms at 30Hz)
-static constexpr int    PAUSED_TICKS_THRESHOLD = 10;
-// Width of the sliding window used to infer play rate
-static constexpr double RATE_WINDOW_SEC        = 2.0;
+static constexpr int PLAY_STATE_FLAG_BIT  = 8; // TODO(windows)
+static constexpr int LOOP_STATE_FLAG_BIT  = 8; // TODO(windows)
+static constexpr int COUNT_IN_FLAG_BIT    = 8; // TODO(windows)
 
-struct GoPlayAlong::Impl
+struct GoPlayAlong::Impl final
 {
-    struct RateSample { std::chrono::steady_clock::time_point time; double position; };
-
-    double m_last_position = -1.0;
-    int    m_paused_ticks  = 0;
-    bool   m_is_playing    = false;
-    double m_play_rate     = 1.0;
-    std::deque<RateSample> m_rate_samples;
-    std::chrono::steady_clock::time_point m_last_tick;
-
     GoPlayAlongState ReadProcessMemory()
     {
         const ProcessReader reader(PROCESS_NAME, MODULE_NAME);
 
-        const double position = reader.ReadMemoryAddress<double>(
+        const double raw_position = reader.ReadMemoryAddress<double>(
             MODULE_OFFSET, {POSITION_OFFSETS[0], POSITION_OFFSETS[1], POSITION_OFFSETS[2]});
 
-        auto now = std::chrono::steady_clock::now();
+        int raw_sel_start = reader.ReadMemoryAddress<int>(
+            MODULE_OFFSET, {TIME_SELECTION_START_OFFSETS[0]});
 
-        if (m_last_position >= 0.0)
+        int raw_sel_end = reader.ReadMemoryAddress<int>(
+            MODULE_OFFSET, {TIME_SELECTION_END_OFFSETS[0]});
+
+        const float raw_play_rate = reader.ReadMemoryAddress<float>(
+            MODULE_OFFSET, {PLAY_RATE_OFFSETS[0]});
+
+        const DWORD raw_play_state = reader.ReadMemoryAddress<DWORD>(
+            MODULE_OFFSET, {PLAY_STATE_OFFSETS[0]});
+
+        const DWORD raw_loop_state = reader.ReadMemoryAddress<DWORD>(
+            MODULE_OFFSET, {LOOP_STATE_OFFSETS[0]});
+
+        const DWORD raw_count_in = reader.ReadMemoryAddress<DWORD>(
+            MODULE_OFFSET, {COUNT_IN_STATE_OFFSETS[0]});
+
+        if (raw_sel_start > raw_sel_end)
         {
-            const double delta = position - m_last_position;
-
-            if (delta > 0.005 && delta < 0.5)
-            {
-                m_is_playing   = true;
-                m_paused_ticks = 0;
-
-                m_rate_samples.push_back({now, position});
-                while (m_rate_samples.size() > 1)
-                {
-                    const double age = std::chrono::duration<double>(now - m_rate_samples.front().time).count();
-                    if (age > RATE_WINDOW_SEC * 2.0) m_rate_samples.pop_front();
-                    else break;
-                }
-
-                if (m_rate_samples.size() >= 4)
-                {
-                    const double window = std::chrono::duration<double>(
-                        m_rate_samples.back().time - m_rate_samples.front().time).count();
-                    if (window >= RATE_WINDOW_SEC)
-                    {
-                        const double rate = (m_rate_samples.back().position - m_rate_samples.front().position) / window;
-                        if (rate > 0.1 && rate < 5.0)
-                            m_play_rate = rate;
-                    }
-                }
-            }
-            else if (++m_paused_ticks >= PAUSED_TICKS_THRESHOLD)
-            {
-                m_is_playing = false;
-                m_rate_samples.clear();
-            }
+            std::swap(raw_sel_start, raw_sel_end);
         }
 
-        m_last_position = position;
-        m_last_tick     = now;
-
         GoPlayAlongState state{};
-        state.play_position = position;
-        state.play_state    = m_is_playing;
-        state.play_rate     = m_play_rate;
+
+        state.play_position                 = raw_position; // already in seconds
+        state.time_selection_start_position = static_cast<double>(raw_sel_start); // TODO(windows): adjust units
+        state.time_selection_end_position   = static_cast<double>(raw_sel_end);   // TODO(windows): adjust units
+        state.play_rate                     = static_cast<double>(raw_play_rate);
+
+        state.play_state     = raw_play_state  & (1U << PLAY_STATE_FLAG_BIT); // TODO(windows): adjust if plain bool
+        state.loop_state     = raw_loop_state  & (1U << LOOP_STATE_FLAG_BIT); // TODO(windows): adjust if plain bool
+        state.count_in_state = raw_count_in    & (1U << COUNT_IN_FLAG_BIT);   // TODO(windows): adjust if plain bool
+
         return state;
     }
 };
 
-GoPlayAlong::GoPlayAlong()  : m_impl(std::make_unique<Impl>()) {}
+GoPlayAlong::GoPlayAlong()
+    : m_impl(std::make_unique<Impl>())
+{}
+
 GoPlayAlong::~GoPlayAlong() = default;
 
 GoPlayAlongState GoPlayAlong::ReadProcessMemory()
@@ -93,4 +85,4 @@ GoPlayAlongState GoPlayAlong::ReadProcessMemory()
     return m_impl->ReadProcessMemory();
 }
 
-} // namespace tnt
+}
