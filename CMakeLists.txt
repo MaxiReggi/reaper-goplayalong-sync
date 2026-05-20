@@ -78,6 +78,10 @@ FetchContent_Declare(GSL
 
 FetchContent_MakeAvailable(reaper-sdk WDL GSL)
 
+# FetchContent sets lowercase variable names; retrieve them explicitly
+FetchContent_GetProperties(WDL)
+FetchContent_GetProperties(reaper-sdk)
+
 # Shared library (REAPER plugin)
 add_library(${PROJECT_NAME} SHARED)
 
@@ -86,7 +90,7 @@ target_include_directories(${PROJECT_NAME}
     ${CMAKE_CURRENT_BINARY_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${reaper-sdk_SOURCE_DIR}/sdk
-    ${WDL_SOURCE_DIR}
+    ${wdl_SOURCE_DIR}
 )
 
 target_link_libraries(${PROJECT_NAME}
