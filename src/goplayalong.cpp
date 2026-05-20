@@ -1,160 +1,91 @@
 #include "goplayalong.h"
-
 #include "process_reader.h"
-#include "wstring_utils.h"
 
-#include <format>
+#include <chrono>
+#include <deque>
 #include <stdexcept>
-#include <utility>
-
-// =============================================================================
-// HOW TO COMPLETE THIS FILE (requires Windows + GoPlayAlong 4 running)
-// =============================================================================
-//
-// This file reads GoPlayAlong's internal memory to extract playback state.
-// The memory offsets below are PLACEHOLDERS and must be found using scanmem
-// or CheatEngine on Windows/Wine with GoPlayAlong 4 running.
-//
-// STEP 1 — Find the process name and module
-//   Open Windows Task Manager (or Process Explorer) while GoPlayAlong is running.
-//   Note the exact .exe name (e.g. "GoPlayAlong.exe", "GoPlayAlong 4.exe").
-//   If it is an Adobe AIR app, the main module IS the .exe itself — use the
-//   same name for both PROCESS_NAME and MODULE_NAME below.
-//   Update the constants PROCESS_NAME and MODULE_NAME accordingly.
-//
-// STEP 2 — Find the playback position in memory
-//   Using scanmem (Linux/Wine) or CheatEngine (Windows):
-//     a) Play a song, pause at a known position (e.g. exactly 10 seconds).
-//     b) Search for the value 10.0 as a float or double.
-//        Also try searching for the value in samples (10 * 44100 = 441000)
-//        as an int, in case GoPlayAlong stores position in samples like Guitar Pro.
-//     c) Resume playback, pause again at a new position. Filter the results.
-//     d) Repeat until you narrow it down to 1-3 addresses.
-//     e) Use "Find what accesses this address" to trace back to the base pointer.
-//        CheatEngine will show you the pointer chain (e.g. module+0xABCD -> +0x18 -> +0x40).
-//   Record the MODULE_OFFSET and POSITION_OFFSETS chain.
-//
-// STEP 3 — Find play state, loop state, and play rate
-//   Repeat the same process for:
-//     - play_state:  search for a boolean/DWORD that is 1 when playing, 0 when stopped
-//     - loop_state:  search for a boolean/DWORD that is 1 when loop is enabled
-//     - play_rate:   search for a float near 1.0 (100% speed), change speed, filter
-//   These are bit flags in Guitar Pro — they may be plain bools in GoPlayAlong.
-//   Adjust the state-reading code below as needed.
-//
-// STEP 4 — Determine position units
-//   Check whether the position value is:
-//     - Seconds (double/float): use it directly
-//     - Samples (int at 44100 Hz): divide by SAMPLE_RATE
-//     - Milliseconds (int): divide by 1000.0
-//   Update the state-building section at the bottom of ReadProcessMemory().
-//
-// STEP 5 — Verify version handling
-//   Call process_reader.GetProcessVersion() and check the returned string.
-//   If GoPlayAlong has a single stable memory layout across versions, you can
-//   skip version-specific offsets. Otherwise, add cases as in Guitar Pro.
-//
-// =============================================================================
 
 namespace tnt {
 
-// TODO(windows): Update these after identifying the process in Task Manager.
-static constexpr wchar_t PROCESS_NAME[] = L"GoPlayAlong.exe";
-static constexpr wchar_t MODULE_NAME[]  = L"GoPlayAlong.exe"; // Same as process if no separate DLL
+static constexpr wchar_t PROCESS_NAME[] = L"Go PlayAlong 4.exe";
+static constexpr wchar_t MODULE_NAME[]  = L"native.node";
+static constexpr int     MODULE_OFFSET  = 0x12FD18;
+// Pointer chain: native.node+0x12FD18 → [+0x14] → [+0x0] → +0xC8 = double (seconds)
+static constexpr int POSITION_OFFSETS[] = {0x14, 0x0, 0xC8};
 
-// TODO(windows): Update after finding the module base offset with scanmem/CheatEngine.
-static constexpr int MODULE_OFFSET = 0x00000000;
+// Ticks of no position advance before declaring paused (~333ms at 30Hz)
+static constexpr int    PAUSED_TICKS_THRESHOLD = 10;
+// Width of the sliding window used to infer play rate
+static constexpr double RATE_WINDOW_SEC        = 2.0;
 
-// TODO(windows): Replace these placeholder offset chains with the real ones.
-// Format: each list follows the pointer chain as exported by CheatEngine.
-// Example from Guitar Pro: { 0x18, 0xA0, 0x38, 0x1A8, 0x20, 0x1D8, 0x0 }
-//
-// If GoPlayAlong stores position as a double/float (seconds), use that directly.
-// If it stores position as samples (int), divide by SAMPLE_RATE below.
-static constexpr int POSITION_OFFSETS[]              = {0x0}; // TODO(windows)
-static constexpr int TIME_SELECTION_START_OFFSETS[]  = {0x0}; // TODO(windows)
-static constexpr int TIME_SELECTION_END_OFFSETS[]    = {0x0}; // TODO(windows)
-static constexpr int PLAY_RATE_OFFSETS[]             = {0x0}; // TODO(windows)
-static constexpr int PLAY_STATE_OFFSETS[]            = {0x0}; // TODO(windows)
-static constexpr int LOOP_STATE_OFFSETS[]            = {0x0}; // TODO(windows)
-static constexpr int COUNT_IN_STATE_OFFSETS[]        = {0x0}; // TODO(windows) - may not exist in GoPlayAlong
-
-// TODO(windows): Verify whether GoPlayAlong stores position in samples or seconds.
-// Guitar Pro uses 44100 Hz. Set to 1 if position is already in seconds.
-static constexpr int SAMPLE_RATE = 44100;
-
-// TODO(windows): Adjust flag bit positions if GoPlayAlong uses bit fields like Guitar Pro.
-// If it uses plain bool values, change the state extraction below accordingly.
-static constexpr int PLAY_STATE_FLAG_BIT  = 8;
-static constexpr int LOOP_STATE_FLAG_BIT  = 8;
-static constexpr int COUNT_IN_FLAG_BIT    = 8;
-
-struct GoPlayAlong::Impl final
+struct GoPlayAlong::Impl
 {
+    struct RateSample { std::chrono::steady_clock::time_point time; double position; };
+
+    double m_last_position = -1.0;
+    int    m_paused_ticks  = 0;
+    bool   m_is_playing    = false;
+    double m_play_rate     = 1.0;
+    std::deque<RateSample> m_rate_samples;
+    std::chrono::steady_clock::time_point m_last_tick;
+
     GoPlayAlongState ReadProcessMemory()
     {
         const ProcessReader reader(PROCESS_NAME, MODULE_NAME);
 
-        // Optional: version check — add cases here if offsets differ between versions.
-        // const auto version = reader.GetProcessVersion();
+        const double position = reader.ReadMemoryAddress<double>(
+            MODULE_OFFSET, {POSITION_OFFSETS[0], POSITION_OFFSETS[1], POSITION_OFFSETS[2]});
 
-        // Read raw values from process memory
-        // TODO(windows): Change the type parameter <int> to match what GoPlayAlong
-        // actually stores (e.g. <double>, <float>, or <int> for samples).
-        const int raw_position = reader.ReadMemoryAddress<int>(
-            MODULE_OFFSET, {POSITION_OFFSETS[0]});
+        auto now = std::chrono::steady_clock::now();
 
-        int raw_sel_start = reader.ReadMemoryAddress<int>(
-            MODULE_OFFSET, {TIME_SELECTION_START_OFFSETS[0]});
-
-        int raw_sel_end = reader.ReadMemoryAddress<int>(
-            MODULE_OFFSET, {TIME_SELECTION_END_OFFSETS[0]});
-
-        const float raw_play_rate = reader.ReadMemoryAddress<float>(
-            MODULE_OFFSET, {PLAY_RATE_OFFSETS[0]});
-
-        // TODO(windows): Adjust these reads based on whether GoPlayAlong uses
-        // bit flags (DWORD) or plain booleans (bool/BYTE) for state values.
-        const DWORD raw_play_state = reader.ReadMemoryAddress<DWORD>(
-            MODULE_OFFSET, {PLAY_STATE_OFFSETS[0]});
-
-        const DWORD raw_loop_state = reader.ReadMemoryAddress<DWORD>(
-            MODULE_OFFSET, {LOOP_STATE_OFFSETS[0]});
-
-        const DWORD raw_count_in = reader.ReadMemoryAddress<DWORD>(
-            MODULE_OFFSET, {COUNT_IN_STATE_OFFSETS[0]});
-
-        // Ensure time selection start is always before end
-        if (raw_sel_start > raw_sel_end)
+        if (m_last_position >= 0.0)
         {
-            std::swap(raw_sel_start, raw_sel_end);
+            const double delta = position - m_last_position;
+
+            if (delta > 0.005 && delta < 0.5)
+            {
+                m_is_playing   = true;
+                m_paused_ticks = 0;
+
+                m_rate_samples.push_back({now, position});
+                while (m_rate_samples.size() > 1)
+                {
+                    const double age = std::chrono::duration<double>(now - m_rate_samples.front().time).count();
+                    if (age > RATE_WINDOW_SEC * 2.0) m_rate_samples.pop_front();
+                    else break;
+                }
+
+                if (m_rate_samples.size() >= 4)
+                {
+                    const double window = std::chrono::duration<double>(
+                        m_rate_samples.back().time - m_rate_samples.front().time).count();
+                    if (window >= RATE_WINDOW_SEC)
+                    {
+                        const double rate = (m_rate_samples.back().position - m_rate_samples.front().position) / window;
+                        if (rate > 0.1 && rate < 5.0)
+                            m_play_rate = rate;
+                    }
+                }
+            }
+            else if (++m_paused_ticks >= PAUSED_TICKS_THRESHOLD)
+            {
+                m_is_playing = false;
+                m_rate_samples.clear();
+            }
         }
 
+        m_last_position = position;
+        m_last_tick     = now;
+
         GoPlayAlongState state{};
-
-        // TODO(windows): Adjust the position conversion to match the unit used by GoPlayAlong.
-        // If position is stored in samples:   divide by SAMPLE_RATE
-        // If position is stored in seconds:   cast directly to double
-        // If position is stored in ms:        divide by 1000.0
-        state.play_position                  = static_cast<double>(raw_position) / SAMPLE_RATE;
-        state.time_selection_start_position  = static_cast<double>(raw_sel_start) / SAMPLE_RATE;
-        state.time_selection_end_position    = static_cast<double>(raw_sel_end)   / SAMPLE_RATE;
-        state.play_rate                      = static_cast<double>(raw_play_rate);
-
-        // TODO(windows): If GoPlayAlong uses plain booleans instead of bit flags,
-        // replace these with: state.play_state = raw_play_state != 0;
-        state.play_state     = raw_play_state  & (1U << PLAY_STATE_FLAG_BIT);
-        state.loop_state     = raw_loop_state  & (1U << LOOP_STATE_FLAG_BIT);
-        state.count_in_state = raw_count_in    & (1U << COUNT_IN_FLAG_BIT);
-
+        state.play_position = position;
+        state.play_state    = m_is_playing;
+        state.play_rate     = m_play_rate;
         return state;
     }
 };
 
-GoPlayAlong::GoPlayAlong()
-    : m_impl(std::make_unique<Impl>())
-{}
-
+GoPlayAlong::GoPlayAlong()  : m_impl(std::make_unique<Impl>()) {}
 GoPlayAlong::~GoPlayAlong() = default;
 
 GoPlayAlongState GoPlayAlong::ReadProcessMemory()
@@ -162,4 +93,4 @@ GoPlayAlongState GoPlayAlong::ReadProcessMemory()
     return m_impl->ReadProcessMemory();
 }
 
-}
+} // namespace tnt
