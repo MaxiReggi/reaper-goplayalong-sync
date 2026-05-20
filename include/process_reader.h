@@ -27,11 +27,15 @@ public:
         m_module_base_address = base;
         m_process_path = GetProcessPath(m_process_id);
 
-        m_process_handle = OpenProcess(PROCESS_VM_READ, FALSE, m_process_id);
+        m_process_handle = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, m_process_id);
         if (m_process_handle == nullptr)
         {
             throw std::runtime_error(std::format("Failed to open process handle (error {:d}).\n", GetLastError()));
         }
+
+        BOOL is_wow64 = FALSE;
+        IsWow64Process(m_process_handle, &is_wow64);
+        m_is_32bit = (is_wow64 == TRUE);
     }
 
     ~ProcessReader()
@@ -203,15 +207,22 @@ private:
                 break;
             }
 
-            // Follow pointer
-            uintptr_t pointer = 0;
+            // Follow pointer — use 4-byte reads for 32-bit target processes
             SIZE_T bytes_read = 0;
-            if (!::ReadProcessMemory(m_process_handle, reinterpret_cast<LPCVOID>(address), &pointer, sizeof(pointer), &bytes_read))
+            if (m_is_32bit)
             {
-                throw std::runtime_error(std::format("ReadPointer: failed at address 0x{:X} (error {:d}).\n",
-                    address, GetLastError()));
+                DWORD pointer32 = 0;
+                if (!::ReadProcessMemory(m_process_handle, reinterpret_cast<LPCVOID>(address), &pointer32, sizeof(pointer32), &bytes_read))
+                    throw std::runtime_error(std::format("ReadPointer: failed at address 0x{:X} (error {:d}).\n", address, GetLastError()));
+                address = static_cast<uintptr_t>(pointer32);
             }
-            address = pointer;
+            else
+            {
+                uintptr_t pointer64 = 0;
+                if (!::ReadProcessMemory(m_process_handle, reinterpret_cast<LPCVOID>(address), &pointer64, sizeof(pointer64), &bytes_read))
+                    throw std::runtime_error(std::format("ReadPointer: failed at address 0x{:X} (error {:d}).\n", address, GetLastError()));
+                address = pointer64;
+            }
         }
 
         return address;
@@ -221,6 +232,7 @@ private:
     std::wstring m_process_path;
     uintptr_t m_module_base_address = 0;
     HANDLE m_process_handle = nullptr;
+    bool m_is_32bit = false;
 };
 
 }
