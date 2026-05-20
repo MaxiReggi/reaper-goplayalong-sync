@@ -22,9 +22,10 @@ public:
     // Throws std::runtime_error if the process or module is not found.
     ProcessReader(const std::wstring& process_name, const std::wstring& module_name)
     {
-        m_process_id = GetProcessID(process_name);
+        auto [pid, base] = FindProcessWithModule(process_name, module_name);
+        m_process_id = pid;
+        m_module_base_address = base;
         m_process_path = GetProcessPath(m_process_id);
-        m_module_base_address = GetModuleBaseAddress(m_process_id, module_name);
 
         m_process_handle = OpenProcess(PROCESS_VM_READ, FALSE, m_process_id);
         if (m_process_handle == nullptr)
@@ -107,32 +108,56 @@ public:
     }
 
 private:
-    DWORD GetProcessID(const std::wstring& process_name) const
+    // Finds the PID and module base of the first process named process_name
+    // that has module_name loaded. Needed because Electron/Node apps spawn
+    // multiple processes with the same exe name, only one of which loads
+    // native modules like native.node.
+    std::pair<DWORD, uintptr_t> FindProcessWithModule(
+        const std::wstring& process_name, const std::wstring& module_name) const
     {
-        HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if (snapshot == INVALID_HANDLE_VALUE)
-        {
+        HANDLE proc_snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (proc_snap == INVALID_HANDLE_VALUE)
             throw std::runtime_error("Failed to create process snapshot.\n");
-        }
 
-        PROCESSENTRY32W entry{};
-        entry.dwSize = sizeof(entry);
+        PROCESSENTRY32W pe{};
+        pe.dwSize = sizeof(pe);
 
-        if (Process32FirstW(snapshot, &entry))
+        if (Process32FirstW(proc_snap, &pe))
         {
             do
             {
-                if (process_name == entry.szExeFile)
+                if (process_name != pe.szExeFile) continue;
+
+                HANDLE mod_snap = CreateToolhelp32Snapshot(
+                    TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pe.th32ProcessID);
+                if (mod_snap == INVALID_HANDLE_VALUE) continue;
+
+                MODULEENTRY32W me{};
+                me.dwSize = sizeof(me);
+
+                if (Module32FirstW(mod_snap, &me))
                 {
-                    CloseHandle(snapshot);
-                    return entry.th32ProcessID;
+                    do
+                    {
+                        if (module_name == me.szModule)
+                        {
+                            uintptr_t base = reinterpret_cast<uintptr_t>(me.modBaseAddr);
+                            CloseHandle(mod_snap);
+                            CloseHandle(proc_snap);
+                            return {pe.th32ProcessID, base};
+                        }
+                    } while (Module32NextW(mod_snap, &me));
                 }
-            } while (Process32NextW(snapshot, &entry));
+
+                CloseHandle(mod_snap);
+            } while (Process32NextW(proc_snap, &pe));
         }
 
-        CloseHandle(snapshot);
-        throw std::runtime_error(std::format("Process not found: '{}'.\nMake sure GoPlayAlong is running.\n",
-            std::string(process_name.begin(), process_name.end())));
+        CloseHandle(proc_snap);
+        throw std::runtime_error(std::format(
+            "No '{}' process with module '{}' found.\nMake sure GoPlayAlong is running.\n",
+            std::string(process_name.begin(), process_name.end()),
+            std::string(module_name.begin(), module_name.end())));
     }
 
     std::wstring GetProcessPath(const DWORD process_id) const
@@ -153,34 +178,6 @@ private:
 
         CloseHandle(handle);
         return std::wstring(path, size);
-    }
-
-    uintptr_t GetModuleBaseAddress(const DWORD process_id, const std::wstring& module_name) const
-    {
-        HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, process_id);
-        if (snapshot == INVALID_HANDLE_VALUE)
-        {
-            throw std::runtime_error("Failed to create module snapshot.\n");
-        }
-
-        MODULEENTRY32W entry{};
-        entry.dwSize = sizeof(entry);
-
-        if (Module32FirstW(snapshot, &entry))
-        {
-            do
-            {
-                if (module_name == entry.szModule)
-                {
-                    CloseHandle(snapshot);
-                    return reinterpret_cast<uintptr_t>(entry.modBaseAddr);
-                }
-            } while (Module32NextW(snapshot, &entry));
-        }
-
-        CloseHandle(snapshot);
-        throw std::runtime_error(std::format("Module not found: '{}'.\n",
-            std::string(module_name.begin(), module_name.end())));
     }
 
     // Follows a pointer chain through process memory.
