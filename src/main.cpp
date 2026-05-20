@@ -66,8 +66,9 @@ extern "C"
     {
         g_plugin_state.hinstance = hinstance;
 
-        if (rec != nullptr && REAPERAPI_LoadAPI(rec->GetFunc) == 0)
+        if (rec != nullptr)
         {
+            REAPERAPI_LoadAPI(rec->GetFunc);
             Register();
             return 1;
         }
