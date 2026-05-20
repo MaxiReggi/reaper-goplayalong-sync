@@ -41,36 +41,12 @@ struct GoPlayAlong::Impl final
         const DWORD raw_play_state = reader.ReadMemoryAddress<DWORD>(
             PLAY_STATE_MODULE_OFFSET, {PLAY_STATE_OFFSETS[0], PLAY_STATE_OFFSETS[1]});
 
-        int raw_sel_start = reader.ReadMemoryAddress<int>(
-            POSITION_MODULE_OFFSET, {TIME_SELECTION_START_OFFSETS[0]});
-
-        int raw_sel_end = reader.ReadMemoryAddress<int>(
-            POSITION_MODULE_OFFSET, {TIME_SELECTION_END_OFFSETS[0]});
-
-        const float raw_play_rate = reader.ReadMemoryAddress<float>(
-            POSITION_MODULE_OFFSET, {PLAY_RATE_OFFSETS[0]});
-
-        const DWORD raw_loop_state = reader.ReadMemoryAddress<DWORD>(
-            POSITION_MODULE_OFFSET, {LOOP_STATE_OFFSETS[0]});
-
-        const DWORD raw_count_in = reader.ReadMemoryAddress<DWORD>(
-            POSITION_MODULE_OFFSET, {COUNT_IN_STATE_OFFSETS[0]});
-
-        if (raw_sel_start > raw_sel_end)
-        {
-            std::swap(raw_sel_start, raw_sel_end);
-        }
-
         GoPlayAlongState state{};
 
-        state.play_position                 = raw_position; // already in seconds
-        state.time_selection_start_position = static_cast<double>(raw_sel_start); // TODO(windows): adjust units
-        state.time_selection_end_position   = static_cast<double>(raw_sel_end);   // TODO(windows): adjust units
-        state.play_rate                     = static_cast<double>(raw_play_rate);
-
-        state.play_state     = raw_play_state != 0;
-        state.loop_state     = raw_loop_state  & (1U << LOOP_STATE_FLAG_BIT); // TODO(windows): adjust if plain bool
-        state.count_in_state = raw_count_in    & (1U << COUNT_IN_FLAG_BIT);   // TODO(windows): adjust if plain bool
+        state.play_position = raw_position;
+        state.play_state    = raw_play_state != 0;
+        state.play_rate     = 1.0; // TODO(windows): read from PLAY_RATE_OFFSETS
+        // time_selection, loop_state, count_in_state: TODO(windows)
 
         return state;
     }
