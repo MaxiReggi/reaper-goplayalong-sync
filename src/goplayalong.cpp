@@ -14,8 +14,9 @@ static constexpr wchar_t MODULE_NAME[]  = L"native.node";
 
 static constexpr int MODULE_OFFSET = 0x12FD18;
 
-// Pointer chain: native.node+0x12FD18 → [+0x14] → [+0x0] → +0xC8 = double (seconds)
-static constexpr int POSITION_OFFSETS[]              = {0x14, 0x0, 0xC8};
+// CheatEngine chain: *(native.node+0x12FD18) → *(+0x14) → *(+0x0) → +0xC8 = double (seconds)
+// Leading 0x0 triggers the initial dereference at the base address before adding offsets.
+static constexpr int POSITION_OFFSETS[]              = {0x0, 0x14, 0x0, 0xC8};
 static constexpr int TIME_SELECTION_START_OFFSETS[]  = {0x0}; // TODO(windows)
 static constexpr int TIME_SELECTION_END_OFFSETS[]    = {0x0}; // TODO(windows)
 static constexpr int PLAY_RATE_OFFSETS[]             = {0x0}; // TODO(windows)
