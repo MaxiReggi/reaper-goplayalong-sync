@@ -20,9 +20,12 @@ static constexpr int POSITION_OFFSETS[]     = {0x0, 0x14, 0x0, 0xC8};
 static constexpr int PLAY_STATE_MODULE_OFFSET = 0x12FD28;
 static constexpr int PLAY_STATE_OFFSETS[]     = {0x0, 0x44};
 
+// *(native.node+0x12FD18) → *(+0x14) → *(+0x4) → *(+0xD8) → *(+0xC) → +0x2C = float (1.0=100%, 0.9=90%, ...)
+static constexpr int PLAY_RATE_MODULE_OFFSET = 0x12FD18;
+static constexpr int PLAY_RATE_OFFSETS[]     = {0x0, 0x14, 0x4, 0xD8, 0xC, 0x2C};
+
 static constexpr int TIME_SELECTION_START_OFFSETS[]  = {0x0}; // TODO(windows)
 static constexpr int TIME_SELECTION_END_OFFSETS[]    = {0x0}; // TODO(windows)
-static constexpr int PLAY_RATE_OFFSETS[]             = {0x0}; // TODO(windows)
 static constexpr int LOOP_STATE_OFFSETS[]            = {0x0}; // TODO(windows)
 static constexpr int COUNT_IN_STATE_OFFSETS[]        = {0x0}; // TODO(windows)
 
@@ -41,11 +44,14 @@ struct GoPlayAlong::Impl final
         const DWORD raw_play_state = reader.ReadMemoryAddress<DWORD>(
             PLAY_STATE_MODULE_OFFSET, {PLAY_STATE_OFFSETS[0], PLAY_STATE_OFFSETS[1]});
 
+        const float raw_play_rate = reader.ReadMemoryAddress<float>(
+            PLAY_RATE_MODULE_OFFSET, {PLAY_RATE_OFFSETS[0], PLAY_RATE_OFFSETS[1], PLAY_RATE_OFFSETS[2], PLAY_RATE_OFFSETS[3], PLAY_RATE_OFFSETS[4], PLAY_RATE_OFFSETS[5]});
+
         GoPlayAlongState state{};
 
         state.play_position = raw_position;
         state.play_state    = raw_play_state != 0;
-        state.play_rate     = 1.0; // TODO(windows): read from PLAY_RATE_OFFSETS
+        state.play_rate     = static_cast<double>(raw_play_rate);
         // time_selection, loop_state, count_in_state: TODO(windows)
 
         return state;
