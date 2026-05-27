@@ -6,7 +6,6 @@
 #include <array>
 #include <memory>
 #include <stdexcept>
-#include <string>
 
 namespace tnt {
 
@@ -19,6 +18,8 @@ static constexpr double MINIMUM_TIME_STEP = 0.001;                 // seconds
 static constexpr double MINIMUM_PLAY_RATE_STEP = 0.001;
 static constexpr double GOPLAYALONG_CURSOR_JUMP_THRESHOLD = 0.1;   // seconds
 static constexpr double LATENCY_COMPENSATION = 0.05;               // seconds
+// GPA updates position at ~15 Hz; 5 consecutive non-advancing ticks ≈ 166 ms of no movement.
+static constexpr int NOT_ADVANCING_STOP_THRESHOLD = 5;
 
 struct Plugin::Impl final
 {
@@ -142,26 +143,24 @@ private:
 
     void SyncPlayState()
     {
-        const bool ps  = m_goplayalong_state.play_state;
-        const bool pps = m_prev_goplayalong_state.play_state;
-        const double pos      = m_goplayalong_state.play_position;
-        const double prev_pos = m_prev_goplayalong_state.play_position;
-        const bool advancing  = pos > prev_pos + MINIMUM_TIME_STEP;
+        const bool ps             = m_goplayalong_state.play_state;
+        const bool pps            = m_prev_goplayalong_state.play_state;
+        const bool advancing      = m_goplayalong_state.play_position > m_prev_goplayalong_state.play_position + MINIMUM_TIME_STEP;
         const bool reaper_stopped = ReaperStoppedOrPaused();
 
-        // Log only on transitions
-        if (ps != pps || advancing != m_prev_advancing || reaper_stopped != m_prev_reaper_stopped)
+        if (!reaper_stopped)
+            m_not_advancing_ticks = advancing ? 0 : m_not_advancing_ticks + 1;
+        else
+            m_not_advancing_ticks = 0;
+
+        // Position-based stop: GPA position frozen for N ticks means GPA is paused/stopped.
+        // This handles songs where play_state stays 1 even when GPA is not playing.
+        if (!reaper_stopped && m_not_advancing_ticks >= NOT_ADVANCING_STOP_THRESHOLD)
         {
-            m_reaper.ShowConsoleMessage(
-                std::string("ps=") + (ps ? "1" : "0")
-                + " pps=" + (pps ? "1" : "0")
-                + " adv=" + (advancing ? "Y" : "N")
-                + " pos=" + std::to_string(pos).substr(0, 6)
-                + " rStop=" + (reaper_stopped ? "Y" : "N")
-                + "\n");
+            m_not_advancing_ticks = 0;
+            m_reaper.SetPlayState(ReaperPlayState::STOPPED);
+            return;
         }
-        m_prev_advancing      = advancing;
-        m_prev_reaper_stopped = reaper_stopped;
 
         if (ps)
         {
@@ -191,14 +190,7 @@ private:
         }
         else if (!reaper_stopped && pps)
         {
-            // Do not cut a time selection short
-            if (m_reaper.GetPlayPosition() < m_goplayalong_state.time_selection_end_position
-             && CompareDoubles(m_reaper.GetPlayPosition(), m_goplayalong_state.time_selection_end_position, DESYNC_THRESHOLD)
-             && !CompareDoubles(m_reaper.GetPlayPosition(), m_goplayalong_state.time_selection_start_position, DESYNC_THRESHOLD))
-            {
-                m_goplayalong_state.play_state = true;
-                return;
-            }
+            // play_state explicitly 0: stop immediately (normal GPA behavior)
             m_reaper.SetPlayState(ReaperPlayState::STOPPED);
         }
     }
@@ -281,8 +273,7 @@ private:
 
     std::array<double, DESYNC_WINDOW_SIZE> m_desync_window = {0.0};
 
-    bool m_prev_advancing      = false;
-    bool m_prev_reaper_stopped = true;
+    int m_not_advancing_ticks = 0;
 
     std::string m_last_error;
 };
