@@ -6,6 +6,7 @@
 #include <array>
 #include <memory>
 #include <stdexcept>
+#include <string>
 
 namespace tnt {
 
@@ -141,7 +142,28 @@ private:
 
     void SyncPlayState()
     {
-        if (m_goplayalong_state.play_state)
+        const bool ps  = m_goplayalong_state.play_state;
+        const bool pps = m_prev_goplayalong_state.play_state;
+        const double pos      = m_goplayalong_state.play_position;
+        const double prev_pos = m_prev_goplayalong_state.play_position;
+        const bool advancing  = pos > prev_pos + MINIMUM_TIME_STEP;
+        const bool reaper_stopped = ReaperStoppedOrPaused();
+
+        // Log only on transitions
+        if (ps != pps || advancing != m_prev_advancing || reaper_stopped != m_prev_reaper_stopped)
+        {
+            m_reaper.ShowConsoleMessage(
+                std::string("ps=") + (ps ? "1" : "0")
+                + " pps=" + (pps ? "1" : "0")
+                + " adv=" + (advancing ? "Y" : "N")
+                + " pos=" + std::to_string(pos).substr(0, 6)
+                + " rStop=" + (reaper_stopped ? "Y" : "N")
+                + "\n");
+        }
+        m_prev_advancing      = advancing;
+        m_prev_reaper_stopped = reaper_stopped;
+
+        if (ps)
         {
             if (m_goplayalong_state.count_in_state
              && (!GoPlayAlongCursorMoved() || (m_goplayalong_state.time_selection_start_position > MINIMUM_TIME_STEP
@@ -154,8 +176,7 @@ private:
                 }
                 m_reaper.SetPlayState(ReaperPlayState::STOPPED);
             }
-            else if (ReaperStoppedOrPaused()
-                  && m_goplayalong_state.play_position > m_prev_goplayalong_state.play_position + MINIMUM_TIME_STEP)
+            else if (reaper_stopped && advancing)
             {
                 if (m_goplayalong_state.time_selection_start_position > MINIMUM_TIME_STEP)
                 {
@@ -168,7 +189,7 @@ private:
                 m_reaper.SetPlayState(ReaperPlayState::PLAYING);
             }
         }
-        else if (!ReaperStoppedOrPaused() && m_prev_goplayalong_state.play_state)
+        else if (!reaper_stopped && pps)
         {
             // Do not cut a time selection short
             if (m_reaper.GetPlayPosition() < m_goplayalong_state.time_selection_end_position
@@ -259,6 +280,9 @@ private:
     GoPlayAlongState m_goplayalong_state;
 
     std::array<double, DESYNC_WINDOW_SIZE> m_desync_window = {0.0};
+
+    bool m_prev_advancing      = false;
+    bool m_prev_reaper_stopped = true;
 
     std::string m_last_error;
 };
