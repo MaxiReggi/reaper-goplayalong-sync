@@ -154,7 +154,8 @@ private:
                 }
                 m_reaper.SetPlayState(ReaperPlayState::STOPPED);
             }
-            else if (ReaperStoppedOrPaused())
+            else if (ReaperStoppedOrPaused() && m_prev_goplayalong_state.play_state
+                  && m_goplayalong_state.play_position > m_prev_goplayalong_state.play_position + MINIMUM_TIME_STEP)
             {
                 if (m_goplayalong_state.time_selection_start_position > MINIMUM_TIME_STEP)
                 {
