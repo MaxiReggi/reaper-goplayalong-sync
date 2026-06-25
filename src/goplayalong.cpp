@@ -45,8 +45,13 @@ struct GoPlayAlong::Impl final
         const DWORD raw_play_state = reader.ReadMemoryAddress<DWORD>(
             PLAY_STATE_MODULE_OFFSET, {PLAY_STATE_OFFSETS[0], PLAY_STATE_OFFSETS[1]});
 
-        const float raw_play_rate = reader.ReadMemoryAddress<float>(
-            PLAY_RATE_MODULE_OFFSET, {PLAY_RATE_OFFSETS[0], PLAY_RATE_OFFSETS[1], PLAY_RATE_OFFSETS[2], PLAY_RATE_OFFSETS[3], PLAY_RATE_OFFSETS[4], PLAY_RATE_OFFSETS[5]});
+        float raw_play_rate = 1.0f;
+        try
+        {
+            raw_play_rate = reader.ReadMemoryAddress<float>(
+                PLAY_RATE_MODULE_OFFSET, {PLAY_RATE_OFFSETS[0], PLAY_RATE_OFFSETS[1], PLAY_RATE_OFFSETS[2], PLAY_RATE_OFFSETS[3], PLAY_RATE_OFFSETS[4], PLAY_RATE_OFFSETS[5]});
+        }
+        catch (const std::runtime_error&) {}
 
         GoPlayAlongState state{};
 
