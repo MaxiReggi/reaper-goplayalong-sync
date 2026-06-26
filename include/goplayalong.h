@@ -14,8 +14,6 @@ struct GoPlayAlongState
     bool play_state = false;
     bool count_in_state = false;
     bool loop_state = false;
-
-    int rate_chain_used = 0; // debug: 0=default, 1=fallback1, 2=fallback2, 3=primary
 };
 
 class GoPlayAlong final

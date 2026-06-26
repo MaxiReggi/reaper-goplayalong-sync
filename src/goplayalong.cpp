@@ -61,13 +61,12 @@ struct GoPlayAlong::Impl final
             PLAY_STATE_MODULE_OFFSET, {PLAY_STATE_OFFSETS[0], PLAY_STATE_OFFSETS[1]});
 
         float raw_play_rate = 1.0f;
-        int rate_chain_used = 0;
         try
         {
             const float rate = reader.ReadMemoryAddress<float>(
                 PLAY_RATE_MODULE_OFFSET, {PLAY_RATE_FALLBACK_1_OFFSETS[0], PLAY_RATE_FALLBACK_1_OFFSETS[1], PLAY_RATE_FALLBACK_1_OFFSETS[2], PLAY_RATE_FALLBACK_1_OFFSETS[3], PLAY_RATE_FALLBACK_1_OFFSETS[4], PLAY_RATE_FALLBACK_1_OFFSETS[5]});
             if (IsValidPlayRate(rate))
-                { raw_play_rate = rate; rate_chain_used = 1; }
+                raw_play_rate = rate;
             else
                 throw std::runtime_error("out of range");
         }
@@ -78,7 +77,7 @@ struct GoPlayAlong::Impl final
                 const float rate = reader.ReadMemoryAddress<float>(
                     PLAY_RATE_MODULE_OFFSET, {PLAY_RATE_FALLBACK_2_OFFSETS[0], PLAY_RATE_FALLBACK_2_OFFSETS[1], PLAY_RATE_FALLBACK_2_OFFSETS[2], PLAY_RATE_FALLBACK_2_OFFSETS[3], PLAY_RATE_FALLBACK_2_OFFSETS[4], PLAY_RATE_FALLBACK_2_OFFSETS[5], PLAY_RATE_FALLBACK_2_OFFSETS[6]});
                 if (IsValidPlayRate(rate))
-                    { raw_play_rate = rate; rate_chain_used = 2; }
+                    raw_play_rate = rate;
                 else
                     throw std::runtime_error("out of range");
             }
@@ -89,19 +88,17 @@ struct GoPlayAlong::Impl final
                     const float rate = reader.ReadMemoryAddress<float>(
                         PLAY_RATE_MODULE_OFFSET, {PLAY_RATE_OFFSETS[0], PLAY_RATE_OFFSETS[1], PLAY_RATE_OFFSETS[2], PLAY_RATE_OFFSETS[3], PLAY_RATE_OFFSETS[4], PLAY_RATE_OFFSETS[5]});
                     if (IsValidPlayRate(rate))
-                        { raw_play_rate = rate; rate_chain_used = 3; }
+                        raw_play_rate = rate;
                 }
                 catch (...) {}
             }
         }
 
-
         GoPlayAlongState state{};
 
-        state.play_position    = raw_position;
-        state.play_state       = raw_play_state != 0;
-        state.play_rate        = static_cast<double>(raw_play_rate);
-        state.rate_chain_used  = rate_chain_used;
+        state.play_position = raw_position;
+        state.play_state    = raw_play_state != 0;
+        state.play_rate     = static_cast<double>(raw_play_rate);
 
         const double raw_sel_start = reader.ReadMemoryAddress<double>(
             PLAY_STATE_MODULE_OFFSET, {TIME_SELECTION_START_OFFSETS[0]});
