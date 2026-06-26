@@ -4,6 +4,8 @@
 #include "reaper.h"
 
 #include <array>
+#include <chrono>
+#include <cmath>
 #include <format>
 #include <memory>
 #include <stdexcept>
@@ -50,11 +52,15 @@ struct Plugin::Impl final
             m_last_error = "";
         }
 
+        if (m_goplayalong_state.rate_chain_used == 0 && m_goplayalong_state.play_state)
+            EstimatePlayRateFromPosition();
+
         if (m_goplayalong_state.play_state && ++m_debug_ticks >= 30)
         {
             m_debug_ticks = 0;
-            m_reaper.ShowConsoleMessage(std::format("[SyncGPA] play_rate={:.4f} chain={}\n",
-                m_goplayalong_state.play_rate, m_goplayalong_state.rate_chain_used));
+            m_reaper.ShowConsoleMessage(std::format("[SyncGPA] play_rate={:.4f} chain={} est={:.4f} votes={}\n",
+                m_goplayalong_state.play_rate, m_goplayalong_state.rate_chain_used,
+                m_estimated_rate, m_estimated_rate_votes));
         }
 
         if (m_goplayalong_state.play_state)
@@ -94,6 +100,57 @@ struct Plugin::Impl final
     }
 
 private:
+    double SnapToValidRate(const double rate) const
+    {
+        constexpr double valid[] = {0.5, 0.6, 0.7, 0.8, 0.9, 1.0};
+        double best = 1.0;
+        double best_dist = 999.0;
+        for (const double v : valid)
+        {
+            const double d = std::fabs(rate - v);
+            if (d < best_dist) { best_dist = d; best = v; }
+        }
+        return best;
+    }
+
+    void EstimatePlayRateFromPosition()
+    {
+        const auto now = std::chrono::steady_clock::now();
+
+        if (!m_prev_goplayalong_state.play_state)
+        {
+            m_last_position_time = now;
+            m_last_position_for_rate = m_goplayalong_state.play_position;
+            m_estimated_rate_votes = 0;
+            return;
+        }
+
+        if (!GoPlayAlongCursorMoved())
+            return;
+
+        const double elapsed = std::chrono::duration<double>(now - m_last_position_time).count();
+        const double pos_delta = m_goplayalong_state.play_position - m_last_position_for_rate;
+
+        m_last_position_time = now;
+        m_last_position_for_rate = m_goplayalong_state.play_position;
+
+        if (elapsed < 0.01 || pos_delta <= 0.0)
+            return;
+
+        const double snapped = SnapToValidRate(pos_delta / elapsed);
+
+        if (CompareDoubles(snapped, m_estimated_rate, 0.001))
+            m_estimated_rate_votes++;
+        else
+        {
+            m_estimated_rate = snapped;
+            m_estimated_rate_votes = 1;
+        }
+
+        if (m_estimated_rate_votes >= 3)
+            m_goplayalong_state.play_rate = m_estimated_rate;
+    }
+
     void SyncLoopState()
     {
         if (m_goplayalong_state.loop_state && !(m_goplayalong_state.play_state && m_goplayalong_state.count_in_state))
@@ -283,6 +340,11 @@ private:
 
     int m_not_advancing_ticks = 0;
     int m_debug_ticks = 0;
+
+    std::chrono::steady_clock::time_point m_last_position_time = std::chrono::steady_clock::now();
+    double m_last_position_for_rate = 0.0;
+    double m_estimated_rate = 1.0;
+    int m_estimated_rate_votes = 0;
 
     std::string m_last_error;
 };
