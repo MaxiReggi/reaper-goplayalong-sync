@@ -64,7 +64,7 @@ struct GoPlayAlong::Impl final
         try
         {
             const float rate = reader.ReadMemoryAddress<float>(
-                PLAY_RATE_MODULE_OFFSET, {PLAY_RATE_OFFSETS[0], PLAY_RATE_OFFSETS[1], PLAY_RATE_OFFSETS[2], PLAY_RATE_OFFSETS[3], PLAY_RATE_OFFSETS[4], PLAY_RATE_OFFSETS[5]});
+                PLAY_RATE_MODULE_OFFSET, {PLAY_RATE_FALLBACK_1_OFFSETS[0], PLAY_RATE_FALLBACK_1_OFFSETS[1], PLAY_RATE_FALLBACK_1_OFFSETS[2], PLAY_RATE_FALLBACK_1_OFFSETS[3], PLAY_RATE_FALLBACK_1_OFFSETS[4]});
             if (IsValidPlayRate(rate))
                 raw_play_rate = rate;
             else
@@ -75,7 +75,7 @@ struct GoPlayAlong::Impl final
             try
             {
                 const float rate = reader.ReadMemoryAddress<float>(
-                    PLAY_RATE_MODULE_OFFSET, {PLAY_RATE_FALLBACK_1_OFFSETS[0], PLAY_RATE_FALLBACK_1_OFFSETS[1], PLAY_RATE_FALLBACK_1_OFFSETS[2], PLAY_RATE_FALLBACK_1_OFFSETS[3], PLAY_RATE_FALLBACK_1_OFFSETS[4]});
+                    PLAY_RATE_MODULE_OFFSET, {PLAY_RATE_FALLBACK_2_OFFSETS[0], PLAY_RATE_FALLBACK_2_OFFSETS[1], PLAY_RATE_FALLBACK_2_OFFSETS[2], PLAY_RATE_FALLBACK_2_OFFSETS[3], PLAY_RATE_FALLBACK_2_OFFSETS[4], PLAY_RATE_FALLBACK_2_OFFSETS[5]});
                 if (IsValidPlayRate(rate))
                     raw_play_rate = rate;
                 else
@@ -86,7 +86,7 @@ struct GoPlayAlong::Impl final
                 try
                 {
                     const float rate = reader.ReadMemoryAddress<float>(
-                        PLAY_RATE_MODULE_OFFSET, {PLAY_RATE_FALLBACK_2_OFFSETS[0], PLAY_RATE_FALLBACK_2_OFFSETS[1], PLAY_RATE_FALLBACK_2_OFFSETS[2], PLAY_RATE_FALLBACK_2_OFFSETS[3], PLAY_RATE_FALLBACK_2_OFFSETS[4], PLAY_RATE_FALLBACK_2_OFFSETS[5]});
+                        PLAY_RATE_MODULE_OFFSET, {PLAY_RATE_OFFSETS[0], PLAY_RATE_OFFSETS[1], PLAY_RATE_OFFSETS[2], PLAY_RATE_OFFSETS[3], PLAY_RATE_OFFSETS[4], PLAY_RATE_OFFSETS[5]});
                     if (IsValidPlayRate(rate))
                         raw_play_rate = rate;
                 }
