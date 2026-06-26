@@ -4,6 +4,7 @@
 #include "reaper.h"
 
 #include <array>
+#include <format>
 #include <memory>
 #include <stdexcept>
 
@@ -47,6 +48,13 @@ struct Plugin::Impl final
         {
             m_reaper.ShowConsoleMessage("Successfully connected to GoPlayAlong process.\n");
             m_last_error = "";
+        }
+
+        if (m_goplayalong_state.play_state && ++m_debug_ticks >= 30)
+        {
+            m_debug_ticks = 0;
+            m_reaper.ShowConsoleMessage(std::format("[SyncGPA] play_rate={:.4f} chain={}\n",
+                m_goplayalong_state.play_rate, m_goplayalong_state.rate_chain_used));
         }
 
         if (m_goplayalong_state.play_state)
@@ -274,6 +282,7 @@ private:
     std::array<double, DESYNC_WINDOW_SIZE> m_desync_window = {0.0};
 
     int m_not_advancing_ticks = 0;
+    int m_debug_ticks = 0;
 
     std::string m_last_error;
 };
