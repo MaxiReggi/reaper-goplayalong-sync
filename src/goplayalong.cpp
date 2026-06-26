@@ -3,6 +3,7 @@
 #include "process_reader.h"
 #include "wstring_utils.h"
 
+#include <cmath>
 #include <format>
 #include <stdexcept>
 #include <utility>
@@ -27,9 +28,23 @@ static constexpr int PLAY_STATE_OFFSETS[]     = {0x0, 0x44};
 static constexpr int TIME_SELECTION_START_OFFSETS[] = {0x20};
 static constexpr int TIME_SELECTION_END_OFFSETS[]   = {0x28};
 
-// *(native.node+0x12FD18) → *(+0x14) → *(+0x4) → *(+0xD8) → *(+0xC) → +0x2C = float (1.0=100%, 0.9=90%, ...)
-static constexpr int PLAY_RATE_MODULE_OFFSET = 0x12FD18;
-static constexpr int PLAY_RATE_OFFSETS[]     = {0x0, 0x14, 0x4, 0xD8, 0xC, 0x2C};
+// Primary:    *(native.node+0x12FD18) → *(+0x0) → *(+0x14) → *(+0x4) → *(+0xD8) → *(+0xC)  → +0x2C (catalog/downloaded files)
+// Fallback 1: *(native.node+0x12FD18) → *(+0x14) → *(+0x4) → *(+0xD8) → *(+0x0) → +0x2C          (user-created .gp files)
+// Fallback 2: *(native.node+0x12FD18) → *(+0x14) → *(+0x4) → *(+0x1C) → *(+0xD8) → *(+0x0) → +0x2C
+static constexpr int PLAY_RATE_MODULE_OFFSET           = 0x12FD18;
+static constexpr int PLAY_RATE_OFFSETS[]               = {0x0, 0x14, 0x4, 0xD8, 0xC, 0x2C};
+static constexpr int PLAY_RATE_FALLBACK_1_OFFSETS[]    = {0x14, 0x4, 0xD8, 0x0, 0x2C};
+static constexpr int PLAY_RATE_FALLBACK_2_OFFSETS[]    = {0x14, 0x4, 0x1C, 0xD8, 0x0, 0x2C};
+static constexpr float PLAY_RATE_VALID[]              = {0.5f, 0.6000000238f, 0.6999999881f, 0.8000000119f, 0.8999999762f, 1.0f};
+static constexpr float PLAY_RATE_EPSILON              = 0.0001f;
+
+static bool IsValidPlayRate(const float rate)
+{
+    for (const float valid : PLAY_RATE_VALID)
+        if (std::fabs(rate - valid) < PLAY_RATE_EPSILON)
+            return true;
+    return false;
+}
 
 // count_in_state: not present in GoPlayAlong, always false
 
@@ -48,10 +63,36 @@ struct GoPlayAlong::Impl final
         float raw_play_rate = 1.0f;
         try
         {
-            raw_play_rate = reader.ReadMemoryAddress<float>(
+            const float rate = reader.ReadMemoryAddress<float>(
                 PLAY_RATE_MODULE_OFFSET, {PLAY_RATE_OFFSETS[0], PLAY_RATE_OFFSETS[1], PLAY_RATE_OFFSETS[2], PLAY_RATE_OFFSETS[3], PLAY_RATE_OFFSETS[4], PLAY_RATE_OFFSETS[5]});
+            if (IsValidPlayRate(rate))
+                raw_play_rate = rate;
+            else
+                throw std::runtime_error("out of range");
         }
-        catch (const std::runtime_error&) {}
+        catch (...)
+        {
+            try
+            {
+                const float rate = reader.ReadMemoryAddress<float>(
+                    PLAY_RATE_MODULE_OFFSET, {PLAY_RATE_FALLBACK_1_OFFSETS[0], PLAY_RATE_FALLBACK_1_OFFSETS[1], PLAY_RATE_FALLBACK_1_OFFSETS[2], PLAY_RATE_FALLBACK_1_OFFSETS[3], PLAY_RATE_FALLBACK_1_OFFSETS[4]});
+                if (IsValidPlayRate(rate))
+                    raw_play_rate = rate;
+                else
+                    throw std::runtime_error("out of range");
+            }
+            catch (...)
+            {
+                try
+                {
+                    const float rate = reader.ReadMemoryAddress<float>(
+                        PLAY_RATE_MODULE_OFFSET, {PLAY_RATE_FALLBACK_2_OFFSETS[0], PLAY_RATE_FALLBACK_2_OFFSETS[1], PLAY_RATE_FALLBACK_2_OFFSETS[2], PLAY_RATE_FALLBACK_2_OFFSETS[3], PLAY_RATE_FALLBACK_2_OFFSETS[4], PLAY_RATE_FALLBACK_2_OFFSETS[5]});
+                    if (IsValidPlayRate(rate))
+                        raw_play_rate = rate;
+                }
+                catch (...) {}
+            }
+        }
 
         GoPlayAlongState state{};
 
