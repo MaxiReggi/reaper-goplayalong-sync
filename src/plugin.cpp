@@ -17,7 +17,6 @@ static constexpr double DESYNC_THRESHOLD = 0.3;                    // seconds
 static constexpr double MINIMUM_TIME_STEP = 0.001;                 // seconds
 static constexpr double MINIMUM_PLAY_RATE_STEP = 0.001;
 static constexpr double GOPLAYALONG_CURSOR_JUMP_THRESHOLD = 0.1;   // seconds
-static constexpr double LATENCY_COMPENSATION = 0.05;               // seconds
 // GPA updates position at ~15 Hz; 5 consecutive non-advancing ticks ≈ 166 ms of no movement.
 static constexpr int NOT_ADVANCING_STOP_THRESHOLD = 5;
 
@@ -119,11 +118,11 @@ private:
             // Follow intentional seeks in GoPlayAlong
             if (!CompareDoubles(m_prev_goplayalong_state.play_position, m_goplayalong_state.play_position, GOPLAYALONG_CURSOR_JUMP_THRESHOLD))
             {
-                SetPlayPosition(m_goplayalong_state.play_position + LATENCY_COMPENSATION);
+                SetPlayPosition(m_goplayalong_state.play_position + m_reaper.GetOutputLatency());
             }
             else if (Desync(DESYNC_THRESHOLD))
             {
-                SetPlayPosition(m_goplayalong_state.play_position + LATENCY_COMPENSATION);
+                SetPlayPosition(m_goplayalong_state.play_position + m_reaper.GetOutputLatency());
             }
         }
     }
@@ -179,11 +178,11 @@ private:
             {
                 if (m_goplayalong_state.time_selection_start_position > MINIMUM_TIME_STEP)
                 {
-                    SetPlayPosition(m_goplayalong_state.time_selection_start_position + LATENCY_COMPENSATION);
+                    SetPlayPosition(m_goplayalong_state.time_selection_start_position + m_reaper.GetOutputLatency());
                 }
                 else
                 {
-                    SetPlayPosition(m_goplayalong_state.play_position + LATENCY_COMPENSATION);
+                    SetPlayPosition(m_goplayalong_state.play_position + m_reaper.GetOutputLatency());
                 }
                 m_reaper.SetPlayState(ReaperPlayState::PLAYING);
             }

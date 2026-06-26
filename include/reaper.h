@@ -24,6 +24,7 @@ public:
     Reaper();
     ~Reaper();
 
+    double GetOutputLatency() const;
     double GetPlayPosition() const;
     double GetPlayRate() const;
     ReaperPlayState GetPlayState() const;

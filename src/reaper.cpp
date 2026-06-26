@@ -13,6 +13,11 @@ static constexpr int PRESERVE_PITCH_COMMAND = 40671;
 
 struct Reaper::Impl final
 {
+    double GetOutputLatency() const
+    {
+        return ::GetOutputLatency();
+    }
+
     double GetPlayPosition() const
     {
         return ::GetPlayPosition();
@@ -113,6 +118,7 @@ Reaper::Reaper()
 
 Reaper::~Reaper() = default;
 
+double Reaper::GetOutputLatency() const { return m_impl->GetOutputLatency(); }
 double Reaper::GetPlayPosition() const { return m_impl->GetPlayPosition(); }
 double Reaper::GetPlayRate() const { return m_impl->GetPlayRate(); }
 ReaperPlayState Reaper::GetPlayState() const { return m_impl->GetPlayState(); }
