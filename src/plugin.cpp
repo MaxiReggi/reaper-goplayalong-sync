@@ -4,21 +4,24 @@
 #include "reaper.h"
 
 #include <array>
+#include <chrono>
 #include <memory>
 #include <stdexcept>
 
 namespace tnt {
 
 // REAPER runs the MainLoop ~30 times/second.
-// A desync window of 9 frames is approximately 300ms.
-static constexpr int DESYNC_WINDOW_SIZE = 9;
+// A desync window of 3 frames is approximately 100ms.
+static constexpr int DESYNC_WINDOW_SIZE = 3;
 
-static constexpr double DESYNC_THRESHOLD = 0.3;                    // seconds
+static constexpr double DESYNC_THRESHOLD = 0.05;                   // seconds
 static constexpr double MINIMUM_TIME_STEP = 0.001;                 // seconds
 static constexpr double MINIMUM_PLAY_RATE_STEP = 0.001;
 static constexpr double GOPLAYALONG_CURSOR_JUMP_THRESHOLD = 0.1;   // seconds
 // GPA updates position at ~15 Hz; 5 consecutive non-advancing ticks ≈ 166 ms of no movement.
 static constexpr int NOT_ADVANCING_STOP_THRESHOLD = 5;
+// Cap dead reckoning extrapolation to avoid runaway drift between GPA updates.
+static constexpr double DEAD_RECKONING_MAX_EXTRAPOLATION = 0.2;    // seconds
 
 struct Plugin::Impl final
 {
@@ -47,6 +50,8 @@ struct Plugin::Impl final
             m_reaper.ShowConsoleMessage("Successfully connected to GoPlayAlong process.\n");
             m_last_error = "";
         }
+
+        UpdateDeadReckoning();
 
         if (m_goplayalong_state.play_state)
         {
@@ -85,6 +90,31 @@ struct Plugin::Impl final
     }
 
 private:
+    // Dead reckoning: track the last GPA position update and extrapolate forward
+    // using elapsed real time × play rate. This gives a smooth real-time estimate
+    // of GPA's current position between its 15 Hz memory updates, allowing a much
+    // tighter DESYNC_THRESHOLD without triggering false corrections from stale data.
+    void UpdateDeadReckoning()
+    {
+        if (!CompareDoubles(m_goplayalong_state.play_position, m_gpa_reckoned_position, MINIMUM_TIME_STEP))
+        {
+            m_gpa_reckoned_position = m_goplayalong_state.play_position;
+            m_gpa_reckoned_time = std::chrono::steady_clock::now();
+            m_gpa_reckoning_valid = true;
+        }
+    }
+
+    double GetDeadReckonedPosition() const
+    {
+        if (!m_gpa_reckoning_valid || !m_goplayalong_state.play_state)
+            return m_goplayalong_state.play_position;
+
+        const double elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - m_gpa_reckoned_time).count();
+        const double capped = elapsed < DEAD_RECKONING_MAX_EXTRAPOLATION ? elapsed : DEAD_RECKONING_MAX_EXTRAPOLATION;
+        return m_gpa_reckoned_position + capped * m_goplayalong_state.play_rate;
+    }
+
     void SyncLoopState()
     {
         if (m_goplayalong_state.loop_state && !(m_goplayalong_state.play_state && m_goplayalong_state.count_in_state))
@@ -106,7 +136,9 @@ private:
 
     void SyncPlayPosition()
     {
-        if (GoPlayAlongCursorMoved() && !CompareDoubles(m_reaper.GetPlayPosition(), m_goplayalong_state.play_position, DESYNC_THRESHOLD))
+        const double gpa_pos = GetDeadReckonedPosition();
+
+        if (!CompareDoubles(m_reaper.GetPlayPosition(), gpa_pos, DESYNC_THRESHOLD))
         {
             // Do not sync if REAPER is right at a loop boundary
             if (CompareDoubles(m_reaper.GetPlayPosition(), m_goplayalong_state.time_selection_start_position, DESYNC_THRESHOLD)
@@ -118,11 +150,11 @@ private:
             // Follow intentional seeks in GoPlayAlong
             if (!CompareDoubles(m_prev_goplayalong_state.play_position, m_goplayalong_state.play_position, GOPLAYALONG_CURSOR_JUMP_THRESHOLD))
             {
-                SetPlayPosition(m_goplayalong_state.play_position + m_reaper.GetOutputLatency());
+                SetPlayPosition(gpa_pos + m_reaper.GetOutputLatency());
             }
-            else if (Desync(DESYNC_THRESHOLD))
+            else if (Desync(DESYNC_THRESHOLD, gpa_pos))
             {
-                SetPlayPosition(m_goplayalong_state.play_position + m_reaper.GetOutputLatency());
+                SetPlayPosition(gpa_pos + m_reaper.GetOutputLatency());
             }
         }
     }
@@ -194,10 +226,10 @@ private:
         }
     }
 
-    bool Desync(const double threshold)
+    bool Desync(const double threshold, const double reference_position)
     {
         std::rotate(m_desync_window.rbegin(), m_desync_window.rbegin() + 1, m_desync_window.rend());
-        m_desync_window[0] = fabs(m_reaper.GetPlayPosition() - m_goplayalong_state.play_position);
+        m_desync_window[0] = fabs(m_reaper.GetPlayPosition() - reference_position);
 
         for (const double value : m_desync_window)
         {
@@ -275,6 +307,10 @@ private:
     int m_not_advancing_ticks = 0;
 
     std::string m_last_error;
+
+    double m_gpa_reckoned_position = 0.0;
+    std::chrono::steady_clock::time_point m_gpa_reckoned_time;
+    bool m_gpa_reckoning_valid = false;
 };
 
 Plugin::Plugin(PluginState& plugin_state)
