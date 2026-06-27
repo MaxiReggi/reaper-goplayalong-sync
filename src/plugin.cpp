@@ -14,7 +14,7 @@ namespace tnt {
 // A desync window of 3 frames is approximately 100ms.
 static constexpr int DESYNC_WINDOW_SIZE = 3;
 
-static constexpr double DESYNC_THRESHOLD = 0.05;                   // seconds
+static constexpr double DESYNC_THRESHOLD = 0.06;                   // seconds
 static constexpr double MINIMUM_TIME_STEP = 0.001;                 // seconds
 static constexpr double MINIMUM_PLAY_RATE_STEP = 0.001;
 static constexpr double GOPLAYALONG_CURSOR_JUMP_THRESHOLD = 0.1;   // seconds
