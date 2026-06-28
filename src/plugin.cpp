@@ -18,8 +18,8 @@ static constexpr double DESYNC_THRESHOLD = 0.06;                   // seconds
 static constexpr double MINIMUM_TIME_STEP = 0.001;                 // seconds
 static constexpr double MINIMUM_PLAY_RATE_STEP = 0.001;
 static constexpr double GOPLAYALONG_CURSOR_JUMP_THRESHOLD = 0.1;   // seconds
-// GPA updates position at ~15 Hz; 5 consecutive non-advancing ticks ≈ 166 ms of no movement.
-static constexpr int NOT_ADVANCING_STOP_THRESHOLD = 5;
+// GPA updates position at ~15 Hz; 15 consecutive non-advancing ticks ≈ 500 ms of no movement.
+static constexpr int NOT_ADVANCING_STOP_THRESHOLD = 15;
 // Cap dead reckoning extrapolation to avoid runaway drift between GPA updates.
 static constexpr double DEAD_RECKONING_MAX_EXTRAPOLATION = 0.2;    // seconds
 
