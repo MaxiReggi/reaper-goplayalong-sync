@@ -28,7 +28,16 @@ static constexpr double DEAD_RECKONING_MAX_EXTRAPOLATION = 0.2;    // seconds
 static constexpr double POSITION_SERVO_MAX_RATE_NUDGE = 0.004;     // max ±0.4% deviation from nominal tempo
 static constexpr double POSITION_SERVO_JUMP_THRESHOLD  = 0.25;     // seconds; beyond this, drift is treated as a
                                                                     // real discontinuity (stall/glitch) — jump instead
-static constexpr double POSITION_SERVO_GAIN = POSITION_SERVO_MAX_RATE_NUDGE / POSITION_SERVO_JUMP_THRESHOLD;
+// Error at which the nudge saturates at POSITION_SERVO_MAX_RATE_NUDGE. A previous attempt
+// at 0.03s converged fast but caused audible artifacts — REAPER's preserve-pitch time
+// stretch doesn't like the rate being re-issued too often/aggressively. 0.09s is a middle
+// ground: noticeably stronger than treating JUMP_THRESHOLD itself as the saturation point,
+// without hammering the rate as hard as 0.03s did.
+static constexpr double POSITION_SERVO_SATURATION_ERROR = 0.09;   // seconds
+static constexpr double POSITION_SERVO_GAIN = POSITION_SERVO_MAX_RATE_NUDGE / POSITION_SERVO_SATURATION_ERROR;
+// Only re-issue SetPlayRate when the target moved by at least this much, so the time
+// stretch engine isn't asked to recompute on every single tick for negligible changes.
+static constexpr double POSITION_SERVO_UPDATE_STEP = 0.0015;
 
 struct Plugin::Impl final
 {
@@ -175,7 +184,7 @@ private:
         const double correction = std::clamp(error * POSITION_SERVO_GAIN, -POSITION_SERVO_MAX_RATE_NUDGE, POSITION_SERVO_MAX_RATE_NUDGE);
         const double target_rate = m_goplayalong_state.play_rate * (1.0 + correction);
 
-        if (!CompareDoubles(m_reaper.GetPlayRate(), target_rate, MINIMUM_PLAY_RATE_STEP))
+        if (!CompareDoubles(m_reaper.GetPlayRate(), target_rate, POSITION_SERVO_UPDATE_STEP))
         {
             m_reaper.SetPlayRate(target_rate);
         }
