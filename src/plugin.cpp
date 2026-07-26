@@ -39,6 +39,12 @@ static constexpr double POSITION_SERVO_GAIN = POSITION_SERVO_MAX_RATE_NUDGE / PO
 // stretch engine isn't asked to recompute on every single tick for negligible changes.
 static constexpr double POSITION_SERVO_UPDATE_STEP = 0.0015;
 
+// Small hardcoded bias to compensate a residual lag that shows up consistently, everywhere,
+// rather than varying song to song like normal drift — a fixed lead is the right tool for
+// that (the servo/dead-reckoning only correct relative drift, not a constant offset).
+// Tune by ear; set back to 0.0 if it doesn't hold up under more testing.
+static constexpr double EXTRA_LEAD_COMPENSATION = 0.025;   // seconds
+
 struct Plugin::Impl final
 {
     Impl(PluginState& plugin_state)
@@ -165,17 +171,17 @@ private:
         // too long to catch up to a deliberate jump, so just cut over.
         if (!CompareDoubles(m_prev_goplayalong_state.play_position, m_goplayalong_state.play_position, GOPLAYALONG_CURSOR_JUMP_THRESHOLD))
         {
-            SetPlayPosition(gpa_pos + m_reaper.GetOutputLatency());
+            SetPlayPosition(gpa_pos + m_reaper.GetOutputLatency() + EXTRA_LEAD_COMPENSATION);
             return;
         }
 
-        const double error = (gpa_pos + m_reaper.GetOutputLatency()) - reaper_pos;
+        const double error = (gpa_pos + m_reaper.GetOutputLatency() + EXTRA_LEAD_COMPENSATION) - reaper_pos;
 
         if (fabs(error) > POSITION_SERVO_JUMP_THRESHOLD)
         {
             // Drift got too large for a smooth correction (e.g. a stall or a glitched
             // read) — fall back to a hard jump rather than nudging for a long time.
-            SetPlayPosition(gpa_pos + m_reaper.GetOutputLatency());
+            SetPlayPosition(gpa_pos + m_reaper.GetOutputLatency() + EXTRA_LEAD_COMPENSATION);
             return;
         }
 
@@ -252,11 +258,11 @@ private:
             {
                 if (m_goplayalong_state.time_selection_start_position > MINIMUM_TIME_STEP)
                 {
-                    SetPlayPosition(m_goplayalong_state.time_selection_start_position + m_reaper.GetOutputLatency());
+                    SetPlayPosition(m_goplayalong_state.time_selection_start_position + m_reaper.GetOutputLatency() + EXTRA_LEAD_COMPENSATION);
                 }
                 else
                 {
-                    SetPlayPosition(m_goplayalong_state.play_position + m_reaper.GetOutputLatency());
+                    SetPlayPosition(m_goplayalong_state.play_position + m_reaper.GetOutputLatency() + EXTRA_LEAD_COMPENSATION);
                 }
                 m_reaper.SetPlayState(ReaperPlayState::PLAYING);
             }
