@@ -3,7 +3,7 @@
 #include "goplayalong.h"
 #include "reaper.h"
 
-#include <array>
+#include <algorithm>
 #include <chrono>
 #include <memory>
 #include <stdexcept>
@@ -11,17 +11,39 @@
 namespace tnt {
 
 // REAPER runs the MainLoop ~30 times/second.
-// A desync window of 3 frames is approximately 100ms.
-static constexpr int DESYNC_WINDOW_SIZE = 3;
-
-static constexpr double DESYNC_THRESHOLD = 0.06;                   // seconds
 static constexpr double MINIMUM_TIME_STEP = 0.001;                 // seconds
 static constexpr double MINIMUM_PLAY_RATE_STEP = 0.001;
 static constexpr double GOPLAYALONG_CURSOR_JUMP_THRESHOLD = 0.1;   // seconds
+static constexpr double LOOP_BOUNDARY_TOLERANCE = 0.06;            // seconds; don't touch anything this close to a loop edge
 // GPA updates position at ~15 Hz; 15 consecutive non-advancing ticks ≈ 500 ms of no movement.
 static constexpr int NOT_ADVANCING_STOP_THRESHOLD = 15;
 // Cap dead reckoning extrapolation to avoid runaway drift between GPA updates.
 static constexpr double DEAD_RECKONING_MAX_EXTRAPOLATION = 0.2;    // seconds
+
+// Position servo: instead of waiting for drift to accumulate and then jumping REAPER's
+// cursor (which leaves a window of a couple seconds where the tab is visibly out of sync
+// with the audio before the jump happens), continuously nudge REAPER's play rate a tiny,
+// inaudible amount toward GoPlayAlong's position every tick. This keeps the drift from
+// ever growing large enough to be noticeable, instead of correcting it after the fact.
+static constexpr double POSITION_SERVO_MAX_RATE_NUDGE = 0.004;     // max ±0.4% deviation from nominal tempo
+static constexpr double POSITION_SERVO_JUMP_THRESHOLD  = 0.25;     // seconds; beyond this, drift is treated as a
+                                                                    // real discontinuity (stall/glitch) — jump instead
+// Error at which the nudge saturates at POSITION_SERVO_MAX_RATE_NUDGE. A previous attempt
+// at 0.03s converged fast but caused audible artifacts — REAPER's preserve-pitch time
+// stretch doesn't like the rate being re-issued too often/aggressively. 0.09s is a middle
+// ground: noticeably stronger than treating JUMP_THRESHOLD itself as the saturation point,
+// without hammering the rate as hard as 0.03s did.
+static constexpr double POSITION_SERVO_SATURATION_ERROR = 0.09;   // seconds
+static constexpr double POSITION_SERVO_GAIN = POSITION_SERVO_MAX_RATE_NUDGE / POSITION_SERVO_SATURATION_ERROR;
+// Only re-issue SetPlayRate when the target moved by at least this much, so the time
+// stretch engine isn't asked to recompute on every single tick for negligible changes.
+static constexpr double POSITION_SERVO_UPDATE_STEP = 0.0015;
+
+// Small hardcoded bias to compensate a residual lag that shows up consistently, everywhere,
+// rather than varying song to song like normal drift — a fixed lead is the right tool for
+// that (the servo/dead-reckoning only correct relative drift, not a constant offset).
+// Tune by ear; set back to 0.0 if it doesn't hold up under more testing.
+static constexpr double EXTRA_LEAD_COMPENSATION = 0.025;   // seconds
 
 struct Plugin::Impl final
 {
@@ -78,10 +100,7 @@ struct Plugin::Impl final
                 SetPlayPosition(m_goplayalong_state.play_position);
             }
 
-            if (GoPlayAlongPlayRateChanged())
-            {
-                SyncPlayRate();
-            }
+            SyncPlayRate();
         }
 
         SyncPlayState();
@@ -92,8 +111,8 @@ struct Plugin::Impl final
 private:
     // Dead reckoning: track the last GPA position update and extrapolate forward
     // using elapsed real time × play rate. This gives a smooth real-time estimate
-    // of GPA's current position between its 15 Hz memory updates, allowing a much
-    // tighter DESYNC_THRESHOLD without triggering false corrections from stale data.
+    // of GPA's current position between its 15 Hz memory updates, so the position
+    // servo has a stable error signal to correct against instead of stale/jumpy data.
     void UpdateDeadReckoning()
     {
         if (!CompareDoubles(m_goplayalong_state.play_position, m_gpa_reckoned_position, MINIMUM_TIME_STEP))
@@ -137,38 +156,67 @@ private:
     void SyncPlayPosition()
     {
         const double gpa_pos = GetDeadReckonedPosition();
+        const double reaper_pos = m_reaper.GetPlayPosition();
 
-        if (!CompareDoubles(m_reaper.GetPlayPosition(), gpa_pos, DESYNC_THRESHOLD))
+        // Do not touch anything right at a loop boundary — let GoPlayAlong's own loop
+        // reset settle first, and drop any lingering rate nudge so it doesn't carry over.
+        if (CompareDoubles(reaper_pos, m_goplayalong_state.time_selection_start_position, LOOP_BOUNDARY_TOLERANCE)
+         || CompareDoubles(reaper_pos, m_goplayalong_state.time_selection_end_position, LOOP_BOUNDARY_TOLERANCE))
         {
-            // Do not sync if REAPER is right at a loop boundary
-            if (CompareDoubles(m_reaper.GetPlayPosition(), m_goplayalong_state.time_selection_start_position, DESYNC_THRESHOLD)
-             || CompareDoubles(m_reaper.GetPlayPosition(), m_goplayalong_state.time_selection_end_position, DESYNC_THRESHOLD))
-            {
-                return;
-            }
+            ResetPlayRateToNominal();
+            return;
+        }
 
-            // Follow intentional seeks in GoPlayAlong
-            if (!CompareDoubles(m_prev_goplayalong_state.play_position, m_goplayalong_state.play_position, GOPLAYALONG_CURSOR_JUMP_THRESHOLD))
-            {
-                SetPlayPosition(gpa_pos + m_reaper.GetOutputLatency());
-            }
-            else if (Desync(DESYNC_THRESHOLD, gpa_pos))
-            {
-                SetPlayPosition(gpa_pos + m_reaper.GetOutputLatency());
-            }
+        // Follow intentional seeks in GoPlayAlong immediately — a servo nudge would take
+        // too long to catch up to a deliberate jump, so just cut over.
+        if (!CompareDoubles(m_prev_goplayalong_state.play_position, m_goplayalong_state.play_position, GOPLAYALONG_CURSOR_JUMP_THRESHOLD))
+        {
+            SetPlayPosition(gpa_pos + m_reaper.GetOutputLatency() + EXTRA_LEAD_COMPENSATION);
+            return;
+        }
+
+        const double error = (gpa_pos + m_reaper.GetOutputLatency() + EXTRA_LEAD_COMPENSATION) - reaper_pos;
+
+        if (fabs(error) > POSITION_SERVO_JUMP_THRESHOLD)
+        {
+            // Drift got too large for a smooth correction (e.g. a stall or a glitched
+            // read) — fall back to a hard jump rather than nudging for a long time.
+            SetPlayPosition(gpa_pos + m_reaper.GetOutputLatency() + EXTRA_LEAD_COMPENSATION);
+            return;
+        }
+
+        EnablePreservePitch();
+
+        const double correction = std::clamp(error * POSITION_SERVO_GAIN, -POSITION_SERVO_MAX_RATE_NUDGE, POSITION_SERVO_MAX_RATE_NUDGE);
+        const double target_rate = m_goplayalong_state.play_rate * (1.0 + correction);
+
+        if (!CompareDoubles(m_reaper.GetPlayRate(), target_rate, POSITION_SERVO_UPDATE_STEP))
+        {
+            m_reaper.SetPlayRate(target_rate);
         }
     }
 
+    // Cancels any active servo rate nudge, returning REAPER to GoPlayAlong's exact nominal tempo.
+    void ResetPlayRateToNominal()
+    {
+        if (m_goplayalong_state.play_rate > MINIMUM_PLAY_RATE_STEP
+         && !CompareDoubles(m_reaper.GetPlayRate(), m_goplayalong_state.play_rate, MINIMUM_PLAY_RATE_STEP))
+        {
+            m_reaper.SetPlayRate(m_goplayalong_state.play_rate);
+        }
+    }
+
+    // Handles deliberate tempo changes in GoPlayAlong (50/60/70/80/90/100%). Gated on
+    // GoPlayAlongPlayRateChanged() rather than comparing against REAPER's live rate,
+    // since the position servo intentionally keeps REAPER's live rate slightly off the
+    // nominal tempo — comparing directly would fight the servo and pause playback every tick.
     void SyncPlayRate()
     {
-        if (m_goplayalong_state.play_rate > MINIMUM_PLAY_RATE_STEP)
+        if (m_goplayalong_state.play_rate > MINIMUM_PLAY_RATE_STEP && GoPlayAlongPlayRateChanged())
         {
-            if (!CompareDoubles(m_reaper.GetPlayRate(), m_goplayalong_state.play_rate, MINIMUM_PLAY_RATE_STEP))
-            {
-                EnablePreservePitch();
-                m_reaper.SetPlayState(ReaperPlayState::PAUSED);
-                m_reaper.SetPlayRate(m_goplayalong_state.play_rate);
-            }
+            EnablePreservePitch();
+            m_reaper.SetPlayState(ReaperPlayState::PAUSED);
+            m_reaper.SetPlayRate(m_goplayalong_state.play_rate);
         }
     }
 
@@ -210,11 +258,11 @@ private:
             {
                 if (m_goplayalong_state.time_selection_start_position > MINIMUM_TIME_STEP)
                 {
-                    SetPlayPosition(m_goplayalong_state.time_selection_start_position + m_reaper.GetOutputLatency());
+                    SetPlayPosition(m_goplayalong_state.time_selection_start_position + m_reaper.GetOutputLatency() + EXTRA_LEAD_COMPENSATION);
                 }
                 else
                 {
-                    SetPlayPosition(m_goplayalong_state.play_position + m_reaper.GetOutputLatency());
+                    SetPlayPosition(m_goplayalong_state.play_position + m_reaper.GetOutputLatency() + EXTRA_LEAD_COMPENSATION);
                 }
                 m_reaper.SetPlayState(ReaperPlayState::PLAYING);
             }
@@ -226,25 +274,9 @@ private:
         }
     }
 
-    bool Desync(const double threshold, const double reference_position)
-    {
-        std::rotate(m_desync_window.rbegin(), m_desync_window.rbegin() + 1, m_desync_window.rend());
-        m_desync_window[0] = fabs(m_reaper.GetPlayPosition() - reference_position);
-
-        for (const double value : m_desync_window)
-        {
-            if (value < threshold)
-            {
-                return false;
-            }
-        }
-        return true;
-    }
-
     void SetPlayPosition(const double time)
     {
         m_reaper.SetEditCursorPosition(time, false, true);
-        m_desync_window.fill(0.0);
     }
 
     bool CompareDoubles(const double val1, const double val2, const double epsilon) const
@@ -301,8 +333,6 @@ private:
 
     GoPlayAlongState m_prev_goplayalong_state;
     GoPlayAlongState m_goplayalong_state;
-
-    std::array<double, DESYNC_WINDOW_SIZE> m_desync_window = {0.0};
 
     int m_not_advancing_ticks = 0;
 
